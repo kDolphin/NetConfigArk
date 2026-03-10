@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+
+# Backup output and logs (runtime data)
+backups/
+logs/
+
+# Device inventory (contains credentials)
+devices.csv
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Qoder / Lingma
+.qoder/
+.lingma/
