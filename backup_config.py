@@ -10,6 +10,7 @@ Usage:
     python3 backup_config.py --list-types        # Show supported device types
     python3 backup_config.py -c devices.csv      # Batch backup from CSV
     python3 backup_config.py -H 10.0.0.1 -u admin  # Single device backup
+    python3 backup_config.py -c devices.csv --diff  # Compare latest 5 backups per device
 """
 
 import os
@@ -22,6 +23,7 @@ import getpass
 import time
 import re
 import io
+import difflib
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Tuple
@@ -161,6 +163,24 @@ SUPPORTED_TYPES = [t[0] for t in DEVICE_TYPE_INFO]
 
 # Paging residue patterns
 PAGING_RESIDUE_RE = re.compile(r"--\s*[Mm]ore\s*--|-{4}\s*More\s*-{4}", re.IGNORECASE)
+
+# Lines matching these patterns are ignored during --diff comparison.
+# These are auto-generated timestamps that change on every config export
+# but do not represent actual configuration changes.
+DIFF_IGNORE_PATTERNS: List["re.Pattern[str]"] = [
+    # RouterOS: # 2026-03-26 08:50:49 by RouterOS 7.21.3
+    re.compile(r"^#\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+by\s+RouterOS"),
+    # Huawei/H3C: standalone timestamp line  2026-03-26 08:46:20.880 +08:00  or  2026-03-27 10:01:07.430
+    re.compile(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+(\s+[+-]\d{2}:\d{2})?\s*$"),
+    # Cisco IOS: ! Last configuration change at ...
+    re.compile(r"^!\s*Last\s+(configuration\s+change|config\s+update)\s+at\s+", re.IGNORECASE),
+    # Cisco IOS: ! NVRAM config last updated at ...
+    re.compile(r"^!\s*NVRAM\s+config\s+last\s+updated\s+at\s+", re.IGNORECASE),
+    # Cisco NX-OS: !Time: ...
+    re.compile(r"^!Time:\s+", re.IGNORECASE),
+    # Cisco IOS: ntp clock-period (auto-adjusted value)
+    re.compile(r"^ntp\s+clock-period\s+\d+"),
+]
 
 # CSV device_type -> version command for fingerprinting (read-only)
 VERSION_COMMANDS: Dict[str, str] = {
@@ -830,10 +850,18 @@ def backup_single_device(device_info: Dict[str, str], output_dir: str,
         # Fetch config (read-only command only)
         config_cmd = get_config_command(netmiko_type, logger)
         logger.info("[%s] Fetching config: %s (read_timeout=%ds)", ip, config_cmd, read_timeout)
-        config_output = conn.send_command(config_cmd, read_timeout=read_timeout)
+
+        # H3C Comware: always use send_command_timing() because send_command()
+        # frequently truncates large configs — the prompt pattern <hostname>
+        # can match mid-output, causing premature return and inconsistent results.
+        if netmiko_type in ("hp_comware", "hp_comware_telnet"):
+            config_output = conn.send_command_timing(
+                config_cmd, delay_factor=4, max_loops=500)
+        else:
+            config_output = conn.send_command(config_cmd, read_timeout=read_timeout)
 
         # Retry with send_command_timing if output is empty
-        # Some devices (e.g., H3C Comware) have intermittent prompt detection issues
+        # Some devices have intermittent prompt detection issues
         # that cause send_command() to return empty. send_command_timing() uses
         # time-based detection which is more robust as a fallback.
         if not config_output.strip():
@@ -1030,6 +1058,366 @@ def print_summary(results: List[BackupResult], skipped_count: int,
 
 
 # ============================================================================
+# Config diff
+# ============================================================================
+
+@dataclass
+class DeviceDiffResult:
+    """Diff result for a single device."""
+    ip: str
+    hostname: str
+    device_type: str
+    location: str
+    backup_dir: str
+    files_found: int
+    pairs_compared: int
+    pairs_changed: int
+    error: str = ""
+
+
+def filter_timestamp_lines(lines: List[str]) -> List[str]:
+    """Remove lines matching DIFF_IGNORE_PATTERNS (auto-generated timestamps)."""
+    result = []
+    for line in lines:
+        stripped = line.strip()
+        if any(p.search(stripped) for p in DIFF_IGNORE_PATTERNS):
+            continue
+        result.append(line)
+    return result
+
+
+def find_backup_dir_for_device(device_info: Dict[str, str],
+                               output_dir: str) -> Optional[str]:
+    """
+    Find the backup directory for a device under output_dir.
+    Searches backups/<location>/ for a directory starting with <IP>_.
+    Returns the first match or None.
+    """
+    ip = device_info["ip"]
+    location = device_info.get("location", "").strip() or "default"
+    location_dir = os.path.join(output_dir, location)
+
+    if not os.path.isdir(location_dir):
+        return None
+
+    for entry in os.listdir(location_dir):
+        if entry.startswith(f"{ip}_") and os.path.isdir(
+                os.path.join(location_dir, entry)):
+            return os.path.join(location_dir, entry)
+    return None
+
+
+def find_latest_backups(backup_dir: str, count: int = 5) -> List[str]:
+    """
+    Find the latest N backup files in a device backup directory.
+    Only considers .txt files (excludes .incomplete.txt).
+    Returns file paths sorted newest-first.
+    """
+    if not os.path.isdir(backup_dir):
+        return []
+
+    txt_files = []
+    for f in os.listdir(backup_dir):
+        if f.endswith(".txt") and not f.endswith(".incomplete.txt"):
+            txt_files.append(os.path.join(backup_dir, f))
+
+    # Sort by modification time, newest first
+    txt_files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return txt_files[:count]
+
+
+def generate_diff_html(devices: List[Dict[str, str]], output_dir: str,
+                       diff_count: int, no_filter: bool,
+                       logger: logging.Logger) -> Optional[str]:
+    """
+    Generate an HTML diff report comparing the latest N backups for each device.
+    Returns the output file path, or None if no diffs to report.
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    report_file = os.path.join(output_dir, f"diff_report_{timestamp}.html")
+    filter_active = not no_filter
+
+    device_results: List[DeviceDiffResult] = []
+    diff_sections: List[str] = []
+
+    for dev in devices:
+        ip = dev["ip"]
+        hostname = dev.get("hostname", ip)
+        device_type = dev.get("device_type", "unknown")
+        location = dev.get("location", "").strip() or "default"
+
+        backup_dir = find_backup_dir_for_device(dev, output_dir)
+        if not backup_dir:
+            device_results.append(DeviceDiffResult(
+                ip=ip, hostname=hostname, device_type=device_type,
+                location=location, backup_dir="",
+                files_found=0, pairs_compared=0, pairs_changed=0,
+                error="No backup directory found",
+            ))
+            continue
+
+        files = find_latest_backups(backup_dir, diff_count)
+        if len(files) < 2:
+            device_results.append(DeviceDiffResult(
+                ip=ip, hostname=hostname, device_type=device_type,
+                location=location, backup_dir=backup_dir,
+                files_found=len(files), pairs_compared=0, pairs_changed=0,
+                error=f"Only {len(files)} backup(s), need at least 2 to compare",
+            ))
+            continue
+
+        pairs_compared = 0
+        pairs_changed = 0
+        pair_htmls: List[str] = []
+
+        # Compare adjacent pairs: newest vs 2nd, 2nd vs 3rd, ...
+        for i in range(len(files) - 1):
+            newer_path = files[i]
+            older_path = files[i + 1]
+            newer_name = os.path.basename(newer_path)
+            older_name = os.path.basename(older_path)
+
+            with open(older_path, "r", encoding="utf-8", errors="replace") as f:
+                older_lines = f.readlines()
+            with open(newer_path, "r", encoding="utf-8", errors="replace") as f:
+                newer_lines = f.readlines()
+
+            # Apply timestamp filter before comparison
+            if filter_active:
+                older_filtered = filter_timestamp_lines(older_lines)
+                newer_filtered = filter_timestamp_lines(newer_lines)
+            else:
+                older_filtered = older_lines
+                newer_filtered = newer_lines
+
+            pairs_compared += 1
+
+            # Check if identical (after filtering)
+            if older_filtered == newer_filtered:
+                pair_htmls.append(
+                    f'<div class="pair no-change">'
+                    f'<h4>{older_name} &rarr; {newer_name}</h4>'
+                    f'<p class="identical">No changes detected</p>'
+                    f'</div>'
+                )
+                continue
+
+            pairs_changed += 1
+
+            # Generate unified diff (using filtered lines)
+            diff_lines = list(difflib.unified_diff(
+                older_filtered, newer_filtered,
+                fromfile=older_name, tofile=newer_name,
+                lineterm="",
+            ))
+
+            diff_html_lines = []
+            for line in diff_lines:
+                line_stripped = line.rstrip("\n")
+                escaped = (line_stripped
+                           .replace("&", "&amp;")
+                           .replace("<", "&lt;")
+                           .replace(">", "&gt;"))
+                if line_stripped.startswith("+++") or line_stripped.startswith("---"):
+                    diff_html_lines.append(
+                        f'<span class="diff-file">{escaped}</span>')
+                elif line_stripped.startswith("@@"):
+                    diff_html_lines.append(
+                        f'<span class="diff-hunk">{escaped}</span>')
+                elif line_stripped.startswith("+"):
+                    diff_html_lines.append(
+                        f'<span class="diff-add">{escaped}</span>')
+                elif line_stripped.startswith("-"):
+                    diff_html_lines.append(
+                        f'<span class="diff-del">{escaped}</span>')
+                else:
+                    diff_html_lines.append(escaped)
+
+            pair_htmls.append(
+                f'<div class="pair changed">'
+                f'<h4>{older_name} &rarr; {newer_name}</h4>'
+                f'<pre class="diff-block">{"<br>".join(diff_html_lines)}</pre>'
+                f'</div>'
+            )
+
+        device_results.append(DeviceDiffResult(
+            ip=ip, hostname=hostname, device_type=device_type,
+            location=location, backup_dir=backup_dir,
+            files_found=len(files), pairs_compared=pairs_compared,
+            pairs_changed=pairs_changed,
+        ))
+
+        # Build device section
+        status_badge = (
+            '<span class="badge changed">Changes Found</span>'
+            if pairs_changed > 0
+            else '<span class="badge unchanged">No Changes</span>'
+        )
+        diff_sections.append(
+            f'<div class="device-section">'
+            f'<h3>{ip} ({hostname}) '
+            f'<span class="type-tag">{device_type}</span> '
+            f'<span class="loc-tag">{location}</span> '
+            f'{status_badge}'
+            f'</h3>'
+            f'<p class="meta">Backups found: {len(files)} | '
+            f'Pairs compared: {pairs_compared} | '
+            f'Changed: {pairs_changed}</p>'
+            f'{"".join(pair_htmls)}'
+            f'</div>'
+        )
+
+    # Build full HTML
+    total_devices = len(device_results)
+    devices_with_changes = sum(1 for r in device_results if r.pairs_changed > 0)
+    devices_no_changes = sum(1 for r in device_results
+                             if r.pairs_compared > 0 and r.pairs_changed == 0)
+    devices_skipped = sum(1 for r in device_results if r.error)
+
+    # Skipped devices section
+    skipped_html = ""
+    skipped_results = [r for r in device_results if r.error]
+    if skipped_results:
+        rows = []
+        for r in skipped_results:
+            rows.append(
+                f'<tr><td>{r.ip}</td><td>{r.hostname}</td>'
+                f'<td>{r.device_type}</td><td>{r.error}</td></tr>'
+            )
+        skipped_html = (
+            '<div class="device-section skipped">'
+            '<h3>Skipped Devices</h3>'
+            '<table><tr><th>IP</th><th>Hostname</th>'
+            '<th>Type</th><th>Reason</th></tr>'
+            f'{"".join(rows)}'
+            '</table></div>'
+        )
+
+    html = f"""\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Config Diff Report - {timestamp}</title>
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+         "Helvetica Neue", Arial, sans-serif; margin: 0; padding: 20px;
+         background: #f5f5f5; color: #333; }}
+  .container {{ max-width: 1200px; margin: 0 auto; }}
+  h1 {{ color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }}
+  h2 {{ color: #2c3e50; margin-top: 30px; }}
+  h3 {{ color: #34495e; border-bottom: 1px solid #ddd; padding-bottom: 8px; }}
+  h4 {{ color: #555; margin: 10px 0 5px; }}
+  .summary {{ background: #fff; padding: 20px; border-radius: 8px;
+              box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }}
+  .summary-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+                   gap: 15px; }}
+  .summary-card {{ text-align: center; padding: 15px; border-radius: 6px; }}
+  .summary-card .number {{ font-size: 2em; font-weight: bold; }}
+  .summary-card .label {{ font-size: 0.9em; color: #777; }}
+  .card-total {{ background: #eef2f7; }}
+  .card-total .number {{ color: #2c3e50; }}
+  .card-changed {{ background: #fef5e7; }}
+  .card-changed .number {{ color: #e67e22; }}
+  .card-unchanged {{ background: #eafaf1; }}
+  .card-unchanged .number {{ color: #27ae60; }}
+  .card-skipped {{ background: #fdecea; }}
+  .card-skipped .number {{ color: #e74c3c; }}
+  .device-section {{ background: #fff; padding: 20px; border-radius: 8px;
+                     box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }}
+  .meta {{ color: #888; font-size: 0.9em; }}
+  .type-tag {{ background: #3498db; color: #fff; padding: 2px 8px;
+               border-radius: 4px; font-size: 0.8em; }}
+  .loc-tag {{ background: #9b59b6; color: #fff; padding: 2px 8px;
+              border-radius: 4px; font-size: 0.8em; }}
+  .badge {{ padding: 3px 10px; border-radius: 4px; font-size: 0.8em; }}
+  .badge.changed {{ background: #e67e22; color: #fff; }}
+  .badge.unchanged {{ background: #27ae60; color: #fff; }}
+  .pair {{ margin: 15px 0; padding: 10px; border: 1px solid #eee;
+           border-radius: 4px; }}
+  .pair.changed {{ border-left: 4px solid #e67e22; }}
+  .pair.no-change {{ border-left: 4px solid #27ae60; }}
+  .identical {{ color: #27ae60; font-style: italic; }}
+  .diff-block {{ background: #1e1e1e; color: #d4d4d4; padding: 15px;
+                 border-radius: 4px; overflow-x: auto; font-size: 13px;
+                 line-height: 1.5; white-space: pre; }}
+  .diff-add {{ color: #4ec9b0; background: rgba(78, 201, 176, 0.1); }}
+  .diff-del {{ color: #f44747; background: rgba(244, 71, 71, 0.1); }}
+  .diff-hunk {{ color: #569cd6; }}
+  .diff-file {{ color: #dcdcaa; }}
+  table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
+  th, td {{ padding: 8px 12px; text-align: left; border-bottom: 1px solid #eee; }}
+  th {{ background: #f8f9fa; color: #555; }}
+  .footer {{ text-align: center; color: #aaa; font-size: 0.8em;
+             margin-top: 30px; padding: 10px; }}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>Configuration Diff Report</h1>
+<p>Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} |
+   Comparing latest {diff_count} backups per device |
+   Timestamp filter: {"ON" if filter_active else "OFF"}</p>
+
+<div class="summary">
+<div class="summary-grid">
+  <div class="summary-card card-total">
+    <div class="number">{total_devices}</div>
+    <div class="label">Total Devices</div>
+  </div>
+  <div class="summary-card card-changed">
+    <div class="number">{devices_with_changes}</div>
+    <div class="label">With Changes</div>
+  </div>
+  <div class="summary-card card-unchanged">
+    <div class="number">{devices_no_changes}</div>
+    <div class="label">No Changes</div>
+  </div>
+  <div class="summary-card card-skipped">
+    <div class="number">{devices_skipped}</div>
+    <div class="label">Skipped</div>
+  </div>
+</div>
+</div>
+
+<h2>Device Details</h2>
+{"".join(diff_sections)}
+{skipped_html}
+
+<div class="footer">
+  Generated by NetConfigArk &mdash; Network Device Configuration Backup Tool
+</div>
+</div>
+</body>
+</html>"""
+
+    os.makedirs(output_dir, exist_ok=True)
+    with open(report_file, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    return report_file
+
+
+def do_diff(csv_path: str, output_dir: str, diff_count: int,
+            no_filter: bool, logger: logging.Logger) -> None:
+    """Run config diff mode: compare latest N backups for each device in CSV."""
+    devices = parse_csv(csv_path, logger)
+
+    filter_label = "OFF (--no-filter)" if no_filter else "ON"
+    print(f"\n--- Config Diff: comparing latest {diff_count} backups per device "
+          f"(timestamp filter: {filter_label}) ---\n")
+
+    report_path = generate_diff_html(devices, output_dir, diff_count, no_filter, logger)
+
+    if report_path:
+        print(f"\n  Diff report generated: {report_path}")
+        print(f"  Open in browser to view.\n")
+    else:
+        print("\n  No diff report generated (no devices to compare).\n")
+
+
+# ============================================================================
 # --init and --list-types
 # ============================================================================
 
@@ -1170,6 +1558,15 @@ Examples:
   # Burst mode: one thread per device, all devices in parallel
   python3 backup_config.py -c devices.csv --burst
 
+  # Compare latest 5 backups per device (default), generate HTML diff report
+  python3 backup_config.py -c devices.csv --diff
+
+  # Compare latest 3 backups per device
+  python3 backup_config.py -c devices.csv --diff 3
+
+  # Diff without timestamp filtering (show all differences)
+  python3 backup_config.py -c devices.csv --diff --no-filter
+
 Output structure:
   backups/<location>/<IP>_<device_type>[_<hostname>]/<IP>_<device_type>[_<hostname>]_<YYYY-MM-DD>_<HHMMSS>.txt
   (location defaults to "default" if not specified in CSV)
@@ -1243,6 +1640,17 @@ def build_parser() -> argparse.ArgumentParser:
                               help="Show supported device types and exit")
     common_group.add_argument("--init", action="store_true",
                               help="Generate a CSV template file (devices.csv) and exit")
+    common_group.add_argument("--diff", type=int, nargs="?", const=5, default=None,
+                              metavar="N",
+                              help="Compare the latest N backups per device and generate "
+                                   "an HTML diff report (default N=5). "
+                                   "Requires -c to specify CSV file.")
+    common_group.add_argument("--no-filter", action="store_true",
+                              dest="no_filter",
+                              help="Disable timestamp filtering in --diff mode. "
+                                   "By default, auto-generated timestamps (RouterOS export "
+                                   "header, Huawei/Cisco timestamp lines, ntp clock-period) "
+                                   "are excluded from comparison.")
 
     return parser
 
@@ -1317,6 +1725,15 @@ def main():
 
     # Setup logging
     logger = setup_logging(args.verbose)
+
+    # Handle --diff mode
+    if args.diff is not None:
+        diff_count = args.diff
+        if diff_count < 2:
+            print("Error: --diff requires N >= 2 (need at least 2 backups to compare)")
+            sys.exit(1)
+        do_diff(args.csv, args.output, diff_count, args.no_filter, logger)
+        sys.exit(0)
 
     # Determine mode and build device list
     if args.host:

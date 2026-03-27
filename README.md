@@ -28,6 +28,7 @@ Network device configuration backup tool. Connects to switches, routers, and fir
 - **Connection retry** — automatic retry on timeout for intermittent network issues
 - **Empty output retry** — fallback to time-based command for devices with prompt detection quirks
 - **Concurrent execution** — configurable thread count for parallel backups; `--burst` mode for maximum parallelism
+- **Config diff report** — compare latest N backups per device, generate an HTML report with color-coded diffs; auto-generated timestamps filtered by default
 - **Organized output** — backups grouped by location, named by IP/type/hostname/timestamp
 - **Read-only guarantee** — only sends show/display/export commands, never enters config mode
 
@@ -67,6 +68,21 @@ python3 backup_config.py -c devices.csv -w 4 -t 30 --read-timeout 120 --skip-unr
 python3 backup_config.py -c devices.csv --burst
 ```
 
+### Config Diff Mode
+
+```bash
+# Compare latest 5 backups per device (default), generate HTML report
+python3 backup_config.py -c devices.csv --diff
+
+# Compare latest 3 backups per device
+python3 backup_config.py -c devices.csv --diff 3
+
+# Diff without timestamp filtering (show all differences including timestamps)
+python3 backup_config.py -c devices.csv --diff --no-filter
+```
+
+The diff report is saved as `backups/diff_report_<timestamp>.html`. Open it in a browser to see color-coded comparisons of configuration changes across backup versions. By default, auto-generated timestamps (RouterOS export headers, Huawei/Cisco timestamp lines, `ntp clock-period`) are filtered out to reduce noise.
+
 ### Single Device Mode
 
 ```bash
@@ -101,6 +117,8 @@ python3 backup_config.py -H 172.16.0.1 -u admin -p pass123 -P telnet --port 2323
 | `--skip-unreachable` | off | Skip failed devices, backup the rest |
 | `--list-types` | | Show supported device types and exit |
 | `--init` | | Generate CSV template and exit |
+| `--diff [N]` | `5` | Compare latest N backups per device, generate HTML diff report |
+| `--no-filter` | off | Disable timestamp filtering in diff mode |
 
 ## CSV Format
 
