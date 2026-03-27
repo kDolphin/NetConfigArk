@@ -29,6 +29,7 @@ Network device configuration backup tool. Connects to switches, routers, and fir
 - **Empty output retry** — fallback to time-based command for devices with prompt detection quirks
 - **Concurrent execution** — configurable thread count for parallel backups; `--burst` mode for maximum parallelism
 - **Config diff report** — compare latest N backups per device, generate an HTML report with color-coded diffs; auto-generated timestamps filtered by default
+- **Config viewer** — generate an interactive HTML page to browse the latest backup config for each device with syntax highlighting and search
 - **Organized output** — backups grouped by location, named by IP/type/hostname/timestamp
 - **Read-only guarantee** — only sends show/display/export commands, never enters config mode
 
@@ -83,6 +84,15 @@ python3 backup_config.py -c devices.csv --diff --no-filter
 
 The diff report is saved as `backups/diff_report_<timestamp>.html`. Open it in a browser to see color-coded comparisons of configuration changes across backup versions. By default, auto-generated timestamps (RouterOS export headers, Huawei/Cisco timestamp lines, `ntp clock-period`) are filtered out to reduce noise.
 
+### Config View Mode
+
+```bash
+# Generate an HTML viewer for the latest config of each device
+python3 backup_config.py -c devices.csv --view
+```
+
+The viewer is saved as `backups/config_view_<timestamp>.html`. It provides a dual-column layout with a device sidebar (grouped by location, searchable) and a syntax-highlighted config panel. Keyboard shortcuts: `j/k` or arrow keys to navigate devices, `/` to focus search, `Esc` to clear.
+
 ### Single Device Mode
 
 ```bash
@@ -119,6 +129,7 @@ python3 backup_config.py -H 172.16.0.1 -u admin -p pass123 -P telnet --port 2323
 | `--init` | | Generate CSV template and exit |
 | `--diff [N]` | `5` | Compare latest N backups per device, generate HTML diff report |
 | `--no-filter` | off | Disable timestamp filtering in diff mode |
+| `--view` | off | Generate HTML config viewer with syntax highlighting |
 
 ## CSV Format
 

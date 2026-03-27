@@ -11,6 +11,7 @@ Usage:
     python3 backup_config.py -c devices.csv      # Batch backup from CSV
     python3 backup_config.py -H 10.0.0.1 -u admin  # Single device backup
     python3 backup_config.py -c devices.csv --diff  # Compare latest 5 backups per device
+    python3 backup_config.py -c devices.csv --view  # View latest configs with highlighting
 """
 
 import os
@@ -1418,6 +1419,582 @@ def do_diff(csv_path: str, output_dir: str, diff_count: int,
 
 
 # ============================================================================
+# Config viewer
+# ============================================================================
+
+def _syntax_highlight_config(text: str) -> str:
+    """
+    Apply syntax highlighting to network device config text.
+    Returns HTML with <span> tags for coloring.
+    Uses regex-based highlighting tuned for network device configs.
+    """
+    import html as html_mod
+
+    lines = text.splitlines()
+    result_lines: List[str] = []
+
+    # Pre-compile patterns
+    comment_re = re.compile(r"^(\s*)(#.*|!.*)$")
+    section_header_re = re.compile(
+        r"^(\s*)(interface\s+|router\s+|ip\s+route|vlan\s+|acl\s+|"
+        r"rule\s+|policy\s+|security-zone\s+|firewall\s+|"
+        r"bgp\s+|ospf\s+|mpls\s+|aaa|ntp|dns|snmp|logging|sysname|"
+        r"system-view|user-interface|"
+        r"set\s+|config\s+|edit\s+)", re.IGNORECASE)
+    keyword_re = re.compile(
+        r"\b(permit|deny|enable|disable|shutdown|no\s+shutdown|"
+        r"description|switchport|vlanif|loopback|GigabitEthernet|"
+        r"FastEthernet|Ethernet|Vlanif|undo|display|show|"
+        r"ip\s+address|mask|gateway|default-route|"
+        r"trunk|access|hybrid|port|quit|return|end|"
+        r"password|secret|authentication|authorization|accounting)\b", re.IGNORECASE)
+    ip_re = re.compile(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?:/\d{1,2})?)\b")
+    number_re = re.compile(r"\b(\d+)\b")
+    string_re = re.compile(r'("(?:[^"\\]|\\.)*")')
+
+    for line in lines:
+        escaped = html_mod.escape(line)
+
+        # Comment lines (# or !)
+        m = comment_re.match(line)
+        if m:
+            result_lines.append(f'<span class="hl-comment">{escaped}</span>')
+            continue
+
+        # Section headers get special treatment
+        m = section_header_re.match(line)
+        is_section = bool(m)
+
+        # Apply highlighting in order: strings -> IPs -> keywords -> numbers
+        # We use a placeholder approach to avoid double-replacing
+        placeholders: List[str] = []
+        placeholder_idx = 0
+
+        def _replace_and_store(pattern, css_class, text_val):
+            nonlocal placeholder_idx
+            result = text_val
+
+            def replacer(match):
+                nonlocal placeholder_idx
+                ph = f"\x00PH{placeholder_idx}\x00"
+                placeholders.append(f'<span class="{css_class}">{html_mod.escape(match.group(0))}</span>')
+                placeholder_idx += 1
+                return ph
+            result = pattern.sub(replacer, result)
+            return result
+
+        processed = line
+        processed = _replace_and_store(string_re, "hl-string", processed)
+        processed = _replace_and_store(ip_re, "hl-ip", processed)
+        processed = _replace_and_store(keyword_re, "hl-keyword", processed)
+        processed = _replace_and_store(number_re, "hl-number", processed)
+
+        # Escape remaining text (but not placeholders)
+        parts = re.split(r"(\x00PH\d+\x00)", processed)
+        final_parts = []
+        for part in parts:
+            ph_match = re.match(r"\x00PH(\d+)\x00", part)
+            if ph_match:
+                final_parts.append(placeholders[int(ph_match.group(1))])
+            else:
+                final_parts.append(html_mod.escape(part))
+
+        final_line = "".join(final_parts)
+        if is_section:
+            final_line = f'<span class="hl-section">{final_line}</span>'
+
+        result_lines.append(final_line)
+
+    return "\n".join(result_lines)
+
+
+def generate_view_html(devices: List[Dict[str, str]], output_dir: str,
+                       logger: logging.Logger) -> Optional[str]:
+    """
+    Generate a self-contained HTML config viewer page.
+    Shows the latest backup for each device with syntax highlighting.
+    Returns the output file path, or None if no configs found.
+    """
+    import html as html_mod
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    report_file = os.path.join(output_dir, f"config_view_{timestamp}.html")
+
+    # Collect device configs
+    device_entries: List[Dict] = []
+    locations: Dict[str, List[int]] = {}  # location -> list of indices
+
+    for dev in devices:
+        ip = dev["ip"]
+        hostname = dev.get("hostname", ip)
+        device_type = dev.get("device_type", "unknown")
+        location = dev.get("location", "").strip() or "default"
+
+        backup_dir = find_backup_dir_for_device(dev, output_dir)
+        if not backup_dir:
+            logger.debug("[%s] No backup directory found, skipping for view", ip)
+            continue
+
+        files = find_latest_backups(backup_dir, 1)
+        if not files:
+            logger.debug("[%s] No backup files found, skipping for view", ip)
+            continue
+
+        latest_file = files[0]
+        file_stat = os.stat(latest_file)
+        file_size = file_stat.st_size
+        file_mtime = datetime.fromtimestamp(file_stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+
+        with open(latest_file, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+
+        line_count = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
+
+        # Syntax highlight
+        highlighted = _syntax_highlight_config(content)
+
+        idx = len(device_entries)
+        entry = {
+            "idx": idx,
+            "ip": ip,
+            "hostname": hostname,
+            "device_type": device_type,
+            "location": location,
+            "file_name": os.path.basename(latest_file),
+            "file_size": file_size,
+            "file_mtime": file_mtime,
+            "line_count": line_count,
+            "highlighted": highlighted,
+        }
+        device_entries.append(entry)
+
+        if location not in locations:
+            locations[location] = []
+        locations[location].append(idx)
+
+    if not device_entries:
+        return None
+
+    # Build sidebar HTML
+    sidebar_items: List[str] = []
+    sorted_locations = sorted(locations.keys())
+    for loc in sorted_locations:
+        indices = locations[loc]
+        loc_escaped = html_mod.escape(loc)
+        items_html = []
+        for idx in indices:
+            e = device_entries[idx]
+            items_html.append(
+                f'<div class="sidebar-item" data-idx="{idx}" '
+                f'data-search="{html_mod.escape(e["ip"] + " " + e["hostname"] + " " + e["device_type"])}" '
+                f'onclick="selectDevice({idx})">'
+                f'<div class="item-ip">{html_mod.escape(e["ip"])}</div>'
+                f'<div class="item-host">{html_mod.escape(e["hostname"])}</div>'
+                f'<div class="item-type">{html_mod.escape(e["device_type"])}</div>'
+                f'</div>'
+            )
+        sidebar_items.append(
+            f'<div class="sidebar-group" data-location="{loc_escaped}">'
+            f'<div class="group-header">{loc_escaped} '
+            f'<span class="group-count">{len(indices)}</span></div>'
+            f'{"".join(items_html)}'
+            f'</div>'
+        )
+
+    # Build config content sections
+    config_sections: List[str] = []
+    for e in device_entries:
+        size_str = f"{e['file_size']:,} bytes" if e['file_size'] < 1024 * 1024 else f"{e['file_size'] / 1024 / 1024:.1f} MB"
+        config_sections.append(
+            f'<div class="config-panel" id="config-{e["idx"]}" style="display:none;">'
+            f'<div class="config-header">'
+            f'<div class="config-title">'
+            f'<span class="config-ip">{html_mod.escape(e["ip"])}</span>'
+            f'<span class="config-hostname">{html_mod.escape(e["hostname"])}</span>'
+            f'<span class="config-type-tag">{html_mod.escape(e["device_type"])}</span>'
+            f'<span class="config-loc-tag">{html_mod.escape(e["location"])}</span>'
+            f'</div>'
+            f'<div class="config-meta">'
+            f'<span>File: {html_mod.escape(e["file_name"])}</span>'
+            f'<span>Backup: {html_mod.escape(e["file_mtime"])}</span>'
+            f'<span>Size: {size_str}</span>'
+            f'<span>Lines: {e["line_count"]}</span>'
+            f'</div>'
+            f'</div>'
+            f'<div class="config-body"><pre class="config-code"><code>{e["highlighted"]}</code></pre></div>'
+            f'</div>'
+        )
+
+    html = f"""\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Config Viewer - {timestamp}</title>
+<style>
+  /* ---- Theme variables ---- */
+  :root {{
+    --bg-body: #1a1a2e;
+    --bg-sidebar: #16213e;
+    --bg-sidebar-header: #0f3460;
+    --border-color: #0f3460;
+    --bg-input: #1a1a2e;
+    --text-primary: #e0e0e0;
+    --text-secondary: #888;
+    --text-muted: #555;
+    --text-meta: #666;
+    --text-footer: #444;
+    --accent: #e94560;
+    --item-hover: rgba(15, 52, 96, 0.6);
+    --item-active-bg: rgba(233, 69, 96, 0.15);
+    --group-count-bg: #0f3460;
+    --group-count-color: #aaa;
+    --scrollbar-thumb: #0f3460;
+    --scrollbar-thumb-main: #333;
+    --code-bg: #1a1a2e;
+    --code-color: #d4d4d4;
+    --hl-comment: #6a9955;
+    --hl-section: #569cd6;
+    --hl-keyword: #c586c0;
+    --hl-ip: #4ec9b0;
+    --hl-number: #b5cea8;
+    --hl-string: #ce9178;
+    --type-badge-text: #0f3460;
+    --welcome-color: #444;
+    --toggle-bg: #0f3460;
+    --toggle-hover: rgba(233, 69, 96, 0.2);
+  }}
+  body.light {{
+    --bg-body: #f0f2f5;
+    --bg-sidebar: #ffffff;
+    --bg-sidebar-header: #e8ecf1;
+    --border-color: #d0d7de;
+    --bg-input: #f6f8fa;
+    --text-primary: #1f2328;
+    --text-secondary: #656d76;
+    --text-muted: #8b949e;
+    --text-meta: #656d76;
+    --text-footer: #8b949e;
+    --accent: #cf222e;
+    --item-hover: rgba(208, 215, 222, 0.5);
+    --item-active-bg: rgba(207, 34, 46, 0.08);
+    --group-count-bg: #d0d7de;
+    --group-count-color: #656d76;
+    --scrollbar-thumb: #c0c8d0;
+    --scrollbar-thumb-main: #c0c8d0;
+    --code-bg: #ffffff;
+    --code-color: #1f2328;
+    --hl-comment: #6a737d;
+    --hl-section: #0550ae;
+    --hl-keyword: #8250df;
+    --hl-ip: #0a3069;
+    --hl-number: #0550ae;
+    --hl-string: #0a3069;
+    --type-badge-text: #fff;
+    --welcome-color: #8b949e;
+    --toggle-bg: #d0d7de;
+    --toggle-hover: rgba(207, 34, 46, 0.1);
+  }}
+
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+         "Helvetica Neue", Arial, sans-serif;
+         background: var(--bg-body); color: var(--text-primary);
+         height: 100vh; overflow: hidden; transition: background 0.2s, color 0.2s; }}
+
+  .app {{ display: flex; height: 100vh; }}
+
+  /* Sidebar */
+  .sidebar {{ width: 280px; min-width: 280px; background: var(--bg-sidebar);
+              border-right: 1px solid var(--border-color); display: flex;
+              flex-direction: column; overflow: hidden;
+              transition: background 0.2s, border-color 0.2s; }}
+  .sidebar-header {{ padding: 12px 16px; background: var(--bg-sidebar-header);
+                     display: flex; align-items: center; justify-content: space-between;
+                     transition: background 0.2s; }}
+  .sidebar-header .header-left {{ }}
+  .sidebar-header h1 {{ font-size: 15px; color: var(--accent); letter-spacing: 0.5px; }}
+  .sidebar-header .subtitle {{ font-size: 11px; color: var(--text-secondary); margin-top: 4px; }}
+  .theme-toggle {{ background: var(--toggle-bg); border: none; color: var(--text-secondary);
+                   width: 32px; height: 32px; border-radius: 6px; cursor: pointer;
+                   font-size: 16px; display: flex; align-items: center;
+                   justify-content: center; transition: background 0.2s; flex-shrink: 0; }}
+  .theme-toggle:hover {{ background: var(--toggle-hover); }}
+  .search-box {{ padding: 10px 16px; background: var(--bg-sidebar);
+                 border-bottom: 1px solid var(--border-color);
+                 transition: background 0.2s, border-color 0.2s; }}
+  .search-box input {{ width: 100%; padding: 8px 12px; border: 1px solid var(--border-color);
+                        border-radius: 6px; background: var(--bg-input);
+                        color: var(--text-primary); font-size: 13px; outline: none;
+                        transition: background 0.2s, border-color 0.2s, color 0.2s; }}
+  .search-box input:focus {{ border-color: var(--accent); }}
+  .search-box input::placeholder {{ color: var(--text-muted); }}
+  .sidebar-list {{ flex: 1; overflow-y: auto; padding: 8px 0; }}
+  .sidebar-list::-webkit-scrollbar {{ width: 6px; }}
+  .sidebar-list::-webkit-scrollbar-track {{ background: var(--bg-sidebar); }}
+  .sidebar-list::-webkit-scrollbar-thumb {{ background: var(--scrollbar-thumb); border-radius: 3px; }}
+
+  .sidebar-group {{ margin-bottom: 4px; }}
+  .group-header {{ padding: 8px 16px; font-size: 11px; text-transform: uppercase;
+                   color: var(--accent); font-weight: 600; letter-spacing: 1px;
+                   cursor: pointer; user-select: none; display: flex;
+                   align-items: center; justify-content: space-between; }}
+  .group-header:hover {{ background: var(--toggle-hover); }}
+  .group-count {{ background: var(--group-count-bg); color: var(--group-count-color);
+                  padding: 1px 7px; border-radius: 10px; font-size: 10px;
+                  transition: background 0.2s, color 0.2s; }}
+  .sidebar-item {{ padding: 8px 16px 8px 24px; cursor: pointer;
+                   border-left: 3px solid transparent; transition: all 0.15s; }}
+  .sidebar-item:hover {{ background: var(--item-hover); }}
+  .sidebar-item.active {{ background: var(--item-active-bg);
+                          border-left-color: var(--accent); }}
+  .item-ip {{ font-size: 13px; font-weight: 600; color: var(--text-primary);
+              font-family: "SF Mono", "Fira Code", monospace; }}
+  .item-host {{ font-size: 11px; color: var(--text-secondary); margin-top: 2px; }}
+  .item-type {{ font-size: 10px; color: var(--type-badge-text); background: var(--accent);
+                display: inline-block; padding: 1px 6px; border-radius: 3px;
+                margin-top: 3px; font-weight: 500; }}
+
+  /* Main content */
+  .main {{ flex: 1; display: flex; flex-direction: column; overflow: hidden; }}
+
+  .welcome {{ flex: 1; display: flex; align-items: center; justify-content: center;
+              flex-direction: column; color: var(--welcome-color); }}
+  .welcome .icon {{ font-size: 64px; margin-bottom: 16px; opacity: 0.3; }}
+  .welcome p {{ font-size: 15px; }}
+
+  .config-panel {{ flex: 1; display: flex; flex-direction: column; overflow: hidden; }}
+  .config-header {{ padding: 12px 20px; background: var(--bg-sidebar);
+                    border-bottom: 1px solid var(--border-color);
+                    transition: background 0.2s, border-color 0.2s; }}
+  .config-title {{ display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }}
+  .config-ip {{ font-size: 18px; font-weight: 700; color: var(--accent);
+                font-family: "SF Mono", "Fira Code", monospace; }}
+  .config-hostname {{ font-size: 14px; color: var(--text-secondary); }}
+  .config-type-tag {{ background: #3498db; color: #fff; padding: 2px 8px;
+                      border-radius: 4px; font-size: 11px; }}
+  .config-loc-tag {{ background: #9b59b6; color: #fff; padding: 2px 8px;
+                     border-radius: 4px; font-size: 11px; }}
+  .config-meta {{ display: flex; gap: 20px; margin-top: 6px; flex-wrap: wrap; }}
+  .config-meta span {{ font-size: 12px; color: var(--text-meta); }}
+
+  .config-body {{ flex: 1; overflow: auto; padding: 0; }}
+  .config-body::-webkit-scrollbar {{ width: 8px; height: 8px; }}
+  .config-body::-webkit-scrollbar-track {{ background: var(--bg-body); }}
+  .config-body::-webkit-scrollbar-thumb {{ background: var(--scrollbar-thumb-main);
+                                           border-radius: 4px; }}
+
+  .config-code {{ margin: 0; padding: 16px 20px; font-family: "SF Mono", "Fira Code",
+                  "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+                  font-size: 13px; line-height: 1.6; color: var(--code-color);
+                  background: var(--code-bg); white-space: pre; tab-size: 4;
+                  transition: background 0.2s, color 0.2s; }}
+
+  /* Syntax highlighting */
+  .hl-comment {{ color: var(--hl-comment); font-style: italic; }}
+  .hl-section {{ color: var(--hl-section); font-weight: 600; }}
+  .hl-keyword {{ color: var(--hl-keyword); }}
+  .hl-ip {{ color: var(--hl-ip); }}
+  .hl-number {{ color: var(--hl-number); }}
+  .hl-string {{ color: var(--hl-string); }}
+
+  /* Footer */
+  .footer {{ text-align: center; padding: 6px; background: var(--bg-sidebar);
+             border-top: 1px solid var(--border-color); font-size: 11px;
+             color: var(--text-footer); transition: background 0.2s, border-color 0.2s; }}
+
+  /* Responsive */
+  @media (max-width: 768px) {{
+    .sidebar {{ width: 220px; min-width: 220px; }}
+    .config-code {{ font-size: 12px; }}
+  }}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="sidebar">
+    <div class="sidebar-header">
+      <div class="header-left">
+        <h1>NetConfigArk</h1>
+        <div class="subtitle">{len(device_entries)} devices &middot; {datetime.now().strftime("%Y-%m-%d %H:%M")}</div>
+      </div>
+      <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()" title="Toggle light/dark theme">
+        <span id="themeIcon">&#9788;</span>
+      </button>
+    </div>
+    <div class="search-box">
+      <input type="text" id="searchInput" placeholder="Search IP / hostname / type..."
+             oninput="filterDevices(this.value)">
+    </div>
+    <div class="sidebar-list" id="sidebarList">
+      {"".join(sidebar_items)}
+    </div>
+  </div>
+
+  <div class="main" id="mainContent">
+    <div class="welcome" id="welcomePanel">
+      <div class="icon">&#9776;</div>
+      <p>Select a device from the sidebar to view its configuration</p>
+    </div>
+    {"".join(config_sections)}
+    <div class="footer">
+      Generated by NetConfigArk &mdash; Network Device Configuration Backup Tool
+    </div>
+  </div>
+</div>
+
+<script>
+(function() {{
+  var currentIdx = -1;
+
+  // Theme toggle
+  function applyTheme(theme) {{
+    if (theme === 'light') {{
+      document.body.classList.add('light');
+      document.getElementById('themeIcon').innerHTML = '&#9790;';
+    }} else {{
+      document.body.classList.remove('light');
+      document.getElementById('themeIcon').innerHTML = '&#9788;';
+    }}
+  }}
+
+  // Initialize theme from localStorage
+  var savedTheme = localStorage.getItem('netconfigark-theme') || 'dark';
+  applyTheme(savedTheme);
+
+  window.toggleTheme = function() {{
+    var isLight = document.body.classList.contains('light');
+    var newTheme = isLight ? 'dark' : 'light';
+    localStorage.setItem('netconfigark-theme', newTheme);
+    applyTheme(newTheme);
+  }};
+
+  window.selectDevice = function(idx) {{
+    // Hide previous
+    if (currentIdx >= 0) {{
+      var prev = document.getElementById('config-' + currentIdx);
+      if (prev) prev.style.display = 'none';
+      var prevItem = document.querySelector('.sidebar-item[data-idx="' + currentIdx + '"]');
+      if (prevItem) prevItem.classList.remove('active');
+    }}
+
+    // Hide welcome
+    var welcome = document.getElementById('welcomePanel');
+    if (welcome) welcome.style.display = 'none';
+
+    // Show selected
+    var panel = document.getElementById('config-' + idx);
+    if (panel) panel.style.display = 'flex';
+    var item = document.querySelector('.sidebar-item[data-idx="' + idx + '"]');
+    if (item) item.classList.add('active');
+
+    currentIdx = idx;
+  }};
+
+  window.filterDevices = function(query) {{
+    query = query.toLowerCase().trim();
+    var items = document.querySelectorAll('.sidebar-item');
+    var groups = document.querySelectorAll('.sidebar-group');
+
+    // Track which groups have visible items
+    var groupVisibility = {{}};
+
+    items.forEach(function(item) {{
+      var searchText = (item.getAttribute('data-search') || '').toLowerCase();
+      var visible = !query || searchText.indexOf(query) !== -1;
+      item.style.display = visible ? '' : 'none';
+
+      var group = item.closest('.sidebar-group');
+      if (group) {{
+        var loc = group.getAttribute('data-location');
+        if (!groupVisibility[loc]) groupVisibility[loc] = false;
+        if (visible) groupVisibility[loc] = true;
+      }}
+    }});
+
+    groups.forEach(function(group) {{
+      var loc = group.getAttribute('data-location');
+      group.style.display = groupVisibility[loc] ? '' : 'none';
+    }});
+  }};
+
+  // Keyboard navigation
+  document.addEventListener('keydown', function(e) {{
+    if (e.target.tagName === 'INPUT') return;
+
+    var visibleItems = Array.from(document.querySelectorAll(
+      '.sidebar-item:not([style*="display: none"])'));
+    if (!visibleItems.length) return;
+
+    var currentItem = document.querySelector('.sidebar-item.active');
+    var currentPos = currentItem ? visibleItems.indexOf(currentItem) : -1;
+
+    if (e.key === 'ArrowDown' || e.key === 'j') {{
+      e.preventDefault();
+      var next = currentPos + 1;
+      if (next < visibleItems.length) {{
+        var idx = parseInt(visibleItems[next].getAttribute('data-idx'));
+        selectDevice(idx);
+        visibleItems[next].scrollIntoView({{ block: 'nearest' }});
+      }}
+    }} else if (e.key === 'ArrowUp' || e.key === 'k') {{
+      e.preventDefault();
+      var prev = currentPos - 1;
+      if (prev >= 0) {{
+        var idx = parseInt(visibleItems[prev].getAttribute('data-idx'));
+        selectDevice(idx);
+        visibleItems[prev].scrollIntoView({{ block: 'nearest' }});
+      }}
+    }} else if (e.key === '/') {{
+      e.preventDefault();
+      document.getElementById('searchInput').focus();
+    }}
+  }});
+
+  // Focus search on Escape (clear and blur)
+  document.getElementById('searchInput').addEventListener('keydown', function(e) {{
+    if (e.key === 'Escape') {{
+      this.value = '';
+      filterDevices('');
+      this.blur();
+    }}
+  }});
+
+  // Auto-select first device
+  var firstItem = document.querySelector('.sidebar-item');
+  if (firstItem) {{
+    var idx = parseInt(firstItem.getAttribute('data-idx'));
+    selectDevice(idx);
+  }}
+}})();
+</script>
+</body>
+</html>"""
+
+    os.makedirs(output_dir, exist_ok=True)
+    with open(report_file, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    return report_file
+
+
+def do_view(csv_path: str, output_dir: str, logger: logging.Logger) -> None:
+    """Run config view mode: generate HTML viewer for latest backup of each device."""
+    devices = parse_csv(csv_path, logger)
+
+    print(f"\n--- Config Viewer: loading latest backup for each device ---\n")
+
+    report_path = generate_view_html(devices, output_dir, logger)
+
+    if report_path:
+        print(f"\n  Config viewer generated: {report_path}")
+        print(f"  Open in browser to view.\n")
+    else:
+        print("\n  No config viewer generated (no backup files found).\n")
+
+
+# ============================================================================
 # --init and --list-types
 # ============================================================================
 
@@ -1567,6 +2144,9 @@ Examples:
   # Diff without timestamp filtering (show all differences)
   python3 backup_config.py -c devices.csv --diff --no-filter
 
+  # View latest config for each device with syntax highlighting
+  python3 backup_config.py -c devices.csv --view
+
 Output structure:
   backups/<location>/<IP>_<device_type>[_<hostname>]/<IP>_<device_type>[_<hostname>]_<YYYY-MM-DD>_<HHMMSS>.txt
   (location defaults to "default" if not specified in CSV)
@@ -1651,6 +2231,10 @@ def build_parser() -> argparse.ArgumentParser:
                                    "By default, auto-generated timestamps (RouterOS export "
                                    "header, Huawei/Cisco timestamp lines, ntp clock-period) "
                                    "are excluded from comparison.")
+    common_group.add_argument("--view", action="store_true",
+                              help="Generate an HTML page showing the latest backup "
+                                   "config for each device with syntax highlighting. "
+                                   "Requires -c to specify CSV file.")
 
     return parser
 
@@ -1733,6 +2317,11 @@ def main():
             print("Error: --diff requires N >= 2 (need at least 2 backups to compare)")
             sys.exit(1)
         do_diff(args.csv, args.output, diff_count, args.no_filter, logger)
+        sys.exit(0)
+
+    # Handle --view mode
+    if args.view:
+        do_view(args.csv, args.output, logger)
         sys.exit(0)
 
     # Determine mode and build device list
