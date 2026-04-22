@@ -23,10 +23,10 @@ import ipaddress
 import getpass
 import time
 import re
-import io
+import html as html_mod
 import difflib
 from datetime import datetime
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional, Dict, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -267,8 +267,6 @@ class BackupResult:
 # ============================================================================
 
 REQUIRED_CSV_FIELDS = {"ip", "protocol", "username", "password"}
-ALL_CSV_FIELDS = {"ip", "protocol", "port", "username", "password",
-                  "device_type", "enable_password", "hostname", "location"}
 
 
 def parse_csv(file_path: str, logger: logging.Logger) -> List[Dict[str, str]]:
@@ -372,11 +370,12 @@ def parse_csv(file_path: str, logger: logging.Logger) -> List[Dict[str, str]]:
     seen_ips: Dict[str, int] = {}
     for dev in devices:
         ip = dev["ip"]
-        if ip in seen_ips:
-            logger.warning("Duplicate IP '%s' found in CSV (rows %d and later). "
-                           "Only the last entry will be used during pre-check mapping.",
-                           ip, seen_ips[ip])
         seen_ips[ip] = seen_ips.get(ip, 0) + 1
+    for ip, count in seen_ips.items():
+        if count > 1:
+            logger.warning("Duplicate IP '%s' appears %d times in CSV. "
+                           "Only the last entry will be used during pre-check mapping.",
+                           ip, count)
 
     logger.info("Loaded %d device(s) from %s", len(devices), file_path)
     return devices
@@ -388,15 +387,10 @@ def parse_csv(file_path: str, logger: logging.Logger) -> List[Dict[str, str]]:
 
 def _run_ssh_detect(detect_params: dict) -> Optional[str]:
     """Run SSHDetect in a way that can be killed by ThreadPoolExecutor timeout."""
-    old_stderr = sys.stderr
-    sys.stderr = io.StringIO()
-    try:
-        guesser = SSHDetect(**detect_params)
-        best_match = guesser.autodetect()
-        guesser.connection.disconnect()
-        return best_match
-    finally:
-        sys.stderr = old_stderr
+    guesser = SSHDetect(**detect_params)
+    best_match = guesser.autodetect()
+    guesser.connection.disconnect()
+    return best_match
 
 
 def detect_device_type(device_info: Dict[str, str], timeout: int,
@@ -598,8 +592,6 @@ def connect_with_retry(conn_params: dict, ip: str, logger: logging.Logger,
     Retries once by default to handle intermittent network slowness.
     """
     for attempt in range(1 + max_retries):
-        old_stderr = sys.stderr
-        sys.stderr = io.StringIO()
         try:
             conn = ConnectHandler(**conn_params)
             return conn
@@ -610,8 +602,6 @@ def connect_with_retry(conn_params: dict, ip: str, logger: logging.Logger,
                 time.sleep(2)
             else:
                 raise
-        finally:
-            sys.stderr = old_stderr
 
 
 # ============================================================================
@@ -1263,9 +1253,9 @@ def generate_diff_html(devices: List[Dict[str, str]], output_dir: str,
         )
         diff_sections.append(
             f'<div class="device-section">'
-            f'<h3>{ip} ({hostname}) '
-            f'<span class="type-tag">{device_type}</span> '
-            f'<span class="loc-tag">{location}</span> '
+            f'<h3>{html_mod.escape(ip)} ({html_mod.escape(hostname)}) '
+            f'<span class="type-tag">{html_mod.escape(device_type)}</span> '
+            f'<span class="loc-tag">{html_mod.escape(location)}</span> '
             f'{status_badge}'
             f'</h3>'
             f'<p class="meta">Backups found: {len(files)} | '
@@ -1274,6 +1264,10 @@ def generate_diff_html(devices: List[Dict[str, str]], output_dir: str,
             f'{"".join(pair_htmls)}'
             f'</div>'
         )
+
+    # Return None if no usable results
+    if not device_results:
+        return None
 
     # Build full HTML
     total_devices = len(device_results)
@@ -1289,8 +1283,8 @@ def generate_diff_html(devices: List[Dict[str, str]], output_dir: str,
         rows = []
         for r in skipped_results:
             rows.append(
-                f'<tr><td>{r.ip}</td><td>{r.hostname}</td>'
-                f'<td>{r.device_type}</td><td>{r.error}</td></tr>'
+                f'<tr><td>{html_mod.escape(r.ip)}</td><td>{html_mod.escape(r.hostname)}</td>'
+                f'<td>{html_mod.escape(r.device_type)}</td><td>{html_mod.escape(r.error)}</td></tr>'
             )
         skipped_html = (
             '<div class="device-section skipped">'
@@ -1461,8 +1455,6 @@ def _syntax_highlight_config(text: str) -> str:
     Returns HTML with <span> tags for coloring.
     Uses regex-based highlighting tuned for network device configs.
     """
-    import html as html_mod
-
     lines = text.splitlines()
     result_lines: List[str] = []
 
@@ -1550,8 +1542,6 @@ def generate_view_html(devices: List[Dict[str, str]], output_dir: str,
     Returns the output file path, or None if no configs found.
     If output_file is specified, use that path; otherwise generate a default name.
     """
-    import html as html_mod
-
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     report_file = output_file or os.path.join(output_dir, f"config_view_{timestamp}.html")
 
@@ -2425,12 +2415,22 @@ def main():
         sys.exit(1)
 
     # Inject resolved netmiko types into device info
-    # Filter to only passed devices, match by IP
+    # Use composite key (ip, username, device_type) to handle duplicate IPs
+    # with different credentials or device types
     passed_ips = {r.ip for r in passed_results}
-    precheck_map = {r.ip: r for r in passed_results}
+    precheck_map = {}
+    for r in passed_results:
+        key = (r.ip, r.csv_device_type)
+        precheck_map[key] = r
     devices = [dev for dev in devices if dev["ip"] in passed_ips]
     for dev in devices:
-        pr = precheck_map[dev["ip"]]
+        key = (dev["ip"], dev.get("device_type", ""))
+        pr = precheck_map.get(key)
+        if not pr:
+            # Fallback: match by IP only (for backwards compatibility)
+            pr = next((r for r in passed_results if r.ip == dev["ip"]), None)
+        if not pr:
+            continue
         dev["resolved_netmiko_type"] = pr.netmiko_type
         # If type was auto-corrected, update device_type so directory naming reflects it
         if pr.type_corrected:
