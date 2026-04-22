@@ -1087,6 +1087,11 @@ def filter_timestamp_lines(lines: List[str]) -> List[str]:
     return result
 
 
+def _sanitize_filename(name: str) -> str:
+    """Replace filesystem-unsafe characters with underscore."""
+    return re.sub(r'[/\\:*?"<>|]', '_', name)
+
+
 def find_backup_dir_for_device(device_info: Dict[str, str],
                                output_dir: str) -> Optional[str]:
     """
@@ -1129,13 +1134,15 @@ def find_latest_backups(backup_dir: str, count: int = 5) -> List[str]:
 
 def generate_diff_html(devices: List[Dict[str, str]], output_dir: str,
                        diff_count: int, no_filter: bool,
-                       logger: logging.Logger) -> Optional[str]:
+                       logger: logging.Logger,
+                       output_file: Optional[str] = None) -> Optional[str]:
     """
     Generate an HTML diff report comparing the latest N backups for each device.
     Returns the output file path, or None if no diffs to report.
+    If output_file is specified, use that path; otherwise generate a default name.
     """
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    report_file = os.path.join(output_dir, f"diff_report_{timestamp}.html")
+    report_file = output_file or os.path.join(output_dir, f"diff_report_{timestamp}.html")
     filter_active = not no_filter
 
     device_results: List[DeviceDiffResult] = []
@@ -1401,7 +1408,7 @@ def generate_diff_html(devices: List[Dict[str, str]], output_dir: str,
 
 
 def do_diff(csv_path: str, output_dir: str, diff_count: int,
-            no_filter: bool, logger: logging.Logger) -> None:
+            no_filter: bool, split: bool, logger: logging.Logger) -> None:
     """Run config diff mode: compare latest N backups for each device in CSV."""
     devices = parse_csv(csv_path, logger)
 
@@ -1409,13 +1416,39 @@ def do_diff(csv_path: str, output_dir: str, diff_count: int,
     print(f"\n--- Config Diff: comparing latest {diff_count} backups per device "
           f"(timestamp filter: {filter_label}) ---\n")
 
-    report_path = generate_diff_html(devices, output_dir, diff_count, no_filter, logger)
+    if split:
+        # Group devices by location
+        loc_groups: Dict[str, List[Dict[str, str]]] = {}
+        for dev in devices:
+            loc = dev.get("location", "").strip() or "default"
+            loc_groups.setdefault(loc, []).append(dev)
 
-    if report_path:
-        print(f"\n  Diff report generated: {report_path}")
-        print(f"  Open in browser to view.\n")
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        generated = []
+        for loc, loc_devices in sorted(loc_groups.items()):
+            safe_loc = _sanitize_filename(loc)
+            report_file = os.path.join(output_dir,
+                                       f"diff_report_{timestamp}_{safe_loc}.html")
+            path = generate_diff_html(loc_devices, output_dir, diff_count,
+                                      no_filter, logger, report_file)
+            if path:
+                generated.append(path)
+
+        if generated:
+            print(f"\n  Diff reports generated ({len(generated)} files):")
+            for p in generated:
+                print(f"    {p}")
+            print(f"  Open in browser to view.\n")
+        else:
+            print("\n  No diff reports generated (no devices to compare).\n")
     else:
-        print("\n  No diff report generated (no devices to compare).\n")
+        report_path = generate_diff_html(devices, output_dir, diff_count,
+                                         no_filter, logger)
+        if report_path:
+            print(f"\n  Diff report generated: {report_path}")
+            print(f"  Open in browser to view.\n")
+        else:
+            print("\n  No diff report generated (no devices to compare).\n")
 
 
 # ============================================================================
@@ -1509,16 +1542,18 @@ def _syntax_highlight_config(text: str) -> str:
 
 
 def generate_view_html(devices: List[Dict[str, str]], output_dir: str,
-                       logger: logging.Logger) -> Optional[str]:
+                       logger: logging.Logger,
+                       output_file: Optional[str] = None) -> Optional[str]:
     """
     Generate a self-contained HTML config viewer page.
     Shows the latest backup for each device with syntax highlighting.
     Returns the output file path, or None if no configs found.
+    If output_file is specified, use that path; otherwise generate a default name.
     """
     import html as html_mod
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    report_file = os.path.join(output_dir, f"config_view_{timestamp}.html")
+    report_file = output_file or os.path.join(output_dir, f"config_view_{timestamp}.html")
 
     # Collect device configs
     device_entries: List[Dict] = []
@@ -1979,19 +2014,44 @@ def generate_view_html(devices: List[Dict[str, str]], output_dir: str,
     return report_file
 
 
-def do_view(csv_path: str, output_dir: str, logger: logging.Logger) -> None:
+def do_view(csv_path: str, output_dir: str, split: bool,
+            logger: logging.Logger) -> None:
     """Run config view mode: generate HTML viewer for latest backup of each device."""
     devices = parse_csv(csv_path, logger)
 
     print(f"\n--- Config Viewer: loading latest backup for each device ---\n")
 
-    report_path = generate_view_html(devices, output_dir, logger)
+    if split:
+        # Group devices by location
+        loc_groups: Dict[str, List[Dict[str, str]]] = {}
+        for dev in devices:
+            loc = dev.get("location", "").strip() or "default"
+            loc_groups.setdefault(loc, []).append(dev)
 
-    if report_path:
-        print(f"\n  Config viewer generated: {report_path}")
-        print(f"  Open in browser to view.\n")
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        generated = []
+        for loc, loc_devices in sorted(loc_groups.items()):
+            safe_loc = _sanitize_filename(loc)
+            report_file = os.path.join(output_dir,
+                                       f"config_view_{timestamp}_{safe_loc}.html")
+            path = generate_view_html(loc_devices, output_dir, logger, report_file)
+            if path:
+                generated.append(path)
+
+        if generated:
+            print(f"\n  Config viewers generated ({len(generated)} files):")
+            for p in generated:
+                print(f"    {p}")
+            print(f"  Open in browser to view.\n")
+        else:
+            print("\n  No config viewers generated (no backup files found).\n")
     else:
-        print("\n  No config viewer generated (no backup files found).\n")
+        report_path = generate_view_html(devices, output_dir, logger)
+        if report_path:
+            print(f"\n  Config viewer generated: {report_path}")
+            print(f"  Open in browser to view.\n")
+        else:
+            print("\n  No config viewer generated (no backup files found).\n")
 
 
 # ============================================================================
@@ -2147,6 +2207,10 @@ Examples:
   # View latest config for each device with syntax highlighting
   python3 backup_config.py -c devices.csv --view
 
+  # Split diff/view reports into separate files per location
+  python3 backup_config.py -c devices.csv --diff --split
+  python3 backup_config.py -c devices.csv --view --split
+
 Output structure:
   backups/<location>/<IP>_<device_type>[_<hostname>]/<IP>_<device_type>[_<hostname>]_<YYYY-MM-DD>_<HHMMSS>.txt
   (location defaults to "default" if not specified in CSV)
@@ -2235,6 +2299,9 @@ def build_parser() -> argparse.ArgumentParser:
                               help="Generate an HTML page showing the latest backup "
                                    "config for each device with syntax highlighting. "
                                    "Requires -c to specify CSV file.")
+    common_group.add_argument("--split", action="store_true",
+                              help="Split --diff or --view HTML output into separate "
+                                   "files per location. Each file is self-contained.")
 
     return parser
 
@@ -2316,12 +2383,12 @@ def main():
         if diff_count < 2:
             print("Error: --diff requires N >= 2 (need at least 2 backups to compare)")
             sys.exit(1)
-        do_diff(args.csv, args.output, diff_count, args.no_filter, logger)
+        do_diff(args.csv, args.output, diff_count, args.no_filter, args.split, logger)
         sys.exit(0)
 
     # Handle --view mode
     if args.view:
-        do_view(args.csv, args.output, logger)
+        do_view(args.csv, args.output, args.split, logger)
         sys.exit(0)
 
     # Determine mode and build device list

@@ -93,6 +93,18 @@ python3 backup_config.py -c devices.csv --view
 
 The viewer is saved as `backups/config_view_<timestamp>.html`. It provides a dual-column layout with a device sidebar (grouped by location, searchable) and a syntax-highlighted config panel. Keyboard shortcuts: `j/k` or arrow keys to navigate devices, `/` to focus search, `Esc` to clear.
 
+### Split by Location
+
+```bash
+# Generate separate diff reports per location
+python3 backup_config.py -c devices.csv --diff --split
+
+# Generate separate config viewers per location
+python3 backup_config.py -c devices.csv --view --split
+```
+
+Add `--split` to `--diff` or `--view` to produce one HTML file per location instead of a single combined file. Output files are named `<type>_<timestamp>_<location>.html`. Each file is self-contained and can be distributed independently to site administrators.
+
 ### Single Device Mode
 
 ```bash
@@ -130,6 +142,7 @@ python3 backup_config.py -H 172.16.0.1 -u admin -p pass123 -P telnet --port 2323
 | `--diff [N]` | `5` | Compare latest N backups per device, generate HTML diff report |
 | `--no-filter` | off | Disable timestamp filtering in diff mode |
 | `--view` | off | Generate HTML config viewer with syntax highlighting |
+| `--split` | off | Split `--diff`/`--view` output into one file per location |
 
 ## CSV Format
 
