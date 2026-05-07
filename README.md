@@ -1,5 +1,7 @@
 # NetConfigArk
 
+[English](README.md) | [中文](README_zh.md)
+
 Network device configuration backup tool. Connects to switches, routers, and firewalls via SSH/Telnet to fetch running configurations in **read-only** mode (no changes made to devices).
 
 ## Supported Devices
