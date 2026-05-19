@@ -120,6 +120,25 @@ python3 backup_config.py -H 10.0.0.1 -u admin -p pass123 -d cisco --enable-passw
 python3 backup_config.py -H 172.16.0.1 -u admin -p pass123 -P telnet --port 2323 -d h3c
 ```
 
+### Cleanup Old Backups
+
+```bash
+# Remove backups older than 60 days (default)
+python3 backup_config.py --cleanup
+
+# Remove backups older than 30 days
+python3 backup_config.py --cleanup 30
+
+# Backup and auto-cleanup after backup completes
+python3 backup_config.py -c devices.csv --cleanup 90
+```
+
+`--cleanup` can be used in two ways:
+- **Standalone**: removes old backup files from the output directory without running a new backup
+- **With backup**: after new backups are saved, automatically removes files older than the specified number of days
+
+Empty device directories and location directories are also removed after cleanup.
+
 ### CLI Options
 
 | Option | Default | Description |
@@ -145,6 +164,7 @@ python3 backup_config.py -H 172.16.0.1 -u admin -p pass123 -P telnet --port 2323
 | `--no-filter` | off | Disable timestamp filtering in diff mode |
 | `--view` | off | Generate HTML config viewer with syntax highlighting |
 | `--split` | off | Split `--diff`/`--view` output into one file per location |
+| `--cleanup [DAYS]` | `60` | Remove backups older than DAYS days; standalone or with backup |
 
 ## CSV Format
 

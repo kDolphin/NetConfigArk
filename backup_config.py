@@ -952,6 +952,74 @@ def backup_single_device(device_info: Dict[str, str], output_dir: str,
                 pass
 
 
+def cleanup_old_backups(output_dir: str, keep_days: int,
+                       logger: logging.Logger) -> Tuple[int, int]:
+    """
+    Remove backup files older than keep_days from output_dir.
+    Returns (files_removed, bytes_freed).
+    .incomplete.txt files are also cleaned by the same age rule.
+    Empty device directories are removed after cleanup.
+    """
+    if keep_days < 1:
+        print("Error: --cleanup requires DAYS >= 1")
+        return 0, 0
+
+    cutoff = time.time() - keep_days * 86400
+    files_removed = 0
+    bytes_freed = 0
+    empty_dirs = []
+
+    for loc_entry in sorted(os.listdir(output_dir)):
+        loc_path = os.path.join(output_dir, loc_entry)
+        if not os.path.isdir(loc_path):
+            continue
+        for dev_entry in sorted(os.listdir(loc_path)):
+            dev_path = os.path.join(loc_path, dev_entry)
+            if not os.path.isdir(dev_path):
+                continue
+            remaining = 0
+            for f in sorted(os.listdir(dev_path)):
+                fpath = os.path.join(dev_path, f)
+                if not os.path.isfile(fpath):
+                    continue
+                try:
+                    mtime = os.path.getmtime(fpath)
+                except OSError:
+                    continue
+                if mtime < cutoff:
+                    size = os.path.getsize(fpath)
+                    os.remove(fpath)
+                    files_removed += 1
+                    bytes_freed += size
+                    logger.debug("Removed: %s (%s, %d days old)",
+                                 fpath,
+                                 f"{size / 1024:.1f}KB" if size >= 1024 else f"{size}B",
+                                 int((time.time() - mtime) / 86400))
+                else:
+                    remaining += 1
+            if remaining == 0 and not os.listdir(dev_path):
+                empty_dirs.append(dev_path)
+
+    # Remove empty device directories, then empty location directories
+    for d in empty_dirs:
+        try:
+            os.rmdir(d)
+            logger.debug("Removed empty directory: %s", d)
+        except OSError:
+            pass
+    # Check for empty location directories after device dirs removed
+    for loc_entry in sorted(os.listdir(output_dir)):
+        loc_path = os.path.join(output_dir, loc_entry)
+        if os.path.isdir(loc_path) and not os.listdir(loc_path):
+            try:
+                os.rmdir(loc_path)
+                logger.debug("Removed empty location directory: %s", loc_path)
+            except OSError:
+                pass
+
+    return files_removed, bytes_freed
+
+
 def run_backup(devices: List[Dict[str, str]], output_dir: str,
                workers: int, timeout: int, read_timeout: int, run_timestamp: str,
                logger: logging.Logger) -> List[BackupResult]:
@@ -2201,6 +2269,15 @@ Examples:
   python3 backup_config.py -c devices.csv --diff --split
   python3 backup_config.py -c devices.csv --view --split
 
+  # Standalone cleanup: remove backups older than 60 days (default)
+  python3 backup_config.py --cleanup
+
+  # Standalone cleanup: remove backups older than 30 days
+  python3 backup_config.py --cleanup 30
+
+  # Backup and auto-cleanup old files after backup completes
+  python3 backup_config.py -c devices.csv --cleanup 90
+
 Output structure:
   backups/<location>/<IP>_<device_type>[_<hostname>]/<IP>_<device_type>[_<hostname>]_<YYYY-MM-DD>_<HHMMSS>.txt
   (location defaults to "default" if not specified in CSV)
@@ -2292,6 +2369,13 @@ def build_parser() -> argparse.ArgumentParser:
     common_group.add_argument("--split", action="store_true",
                               help="Split --diff or --view HTML output into separate "
                                    "files per location. Each file is self-contained.")
+    common_group.add_argument("--cleanup", type=int, nargs="?", const=60, default=None,
+                              metavar="DAYS",
+                              help="Remove backup files older than DAYS days "
+                                   "(default: 60). Can be used standalone to clean up "
+                                   "old backups without running a new backup, "
+                                   "or combined with backup to auto-clean after "
+                                   "new backups are saved.")
 
     return parser
 
@@ -2381,6 +2465,31 @@ def main():
         do_view(args.csv, args.output, args.split, logger)
         sys.exit(0)
 
+    # Handle --cleanup standalone mode (no backup, just clean old files)
+    if args.cleanup is not None and not args.host and args.csv == "devices.csv":
+        # --cleanup used alone (no -H, no custom -c): just clean the output directory
+        keep_days = args.cleanup
+        if keep_days < 1:
+            print("Error: --cleanup requires DAYS >= 1")
+            sys.exit(1)
+        output_dir = os.path.abspath(args.output)
+        if not os.path.isdir(output_dir):
+            print(f"Output directory does not exist: {output_dir}")
+            sys.exit(0)
+        print(f"\n--- Cleaning backups older than {keep_days} days ---\n")
+        files_removed, bytes_freed = cleanup_old_backups(output_dir, keep_days, logger)
+        if files_removed > 0:
+            if bytes_freed >= 1024 * 1024:
+                size_str = f"{bytes_freed / 1024 / 1024:.1f} MB"
+            elif bytes_freed >= 1024:
+                size_str = f"{bytes_freed / 1024:.1f} KB"
+            else:
+                size_str = f"{bytes_freed} B"
+            print(f"\n  Cleaned {files_removed} file(s), freed {size_str}\n")
+        else:
+            print("\n  No files older than %d days found.\n" % keep_days)
+        sys.exit(0)
+
     # Determine mode and build device list
     if args.host:
         # Single device mode
@@ -2449,6 +2558,26 @@ def main():
 
     # Phase 3: Summary
     print_summary(backup_results, skipped_count, precheck_results, overall_start, logger)
+
+    # Phase 4: Cleanup old backups (if --cleanup specified with backup)
+    if args.cleanup is not None:
+        keep_days = args.cleanup
+        if keep_days < 1:
+            logger.warning("--cleanup requires DAYS >= 1, skipping cleanup")
+        else:
+            print(f"\n--- Phase 4: Cleanup (removing backups older than {keep_days} days) ---\n")
+            output_dir = os.path.abspath(args.output)
+            files_removed, bytes_freed = cleanup_old_backups(output_dir, keep_days, logger)
+            if files_removed > 0:
+                if bytes_freed >= 1024 * 1024:
+                    size_str = f"{bytes_freed / 1024 / 1024:.1f} MB"
+                elif bytes_freed >= 1024:
+                    size_str = f"{bytes_freed / 1024:.1f} KB"
+                else:
+                    size_str = f"{bytes_freed} B"
+                print(f"  Cleaned {files_removed} file(s), freed {size_str}\n")
+            else:
+                print(f"  No files older than {keep_days} days found.\n")
 
     # Exit code: non-zero if any backup failed or devices were skipped
     failed_count = sum(1 for r in backup_results if not r.success)

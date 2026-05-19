@@ -121,6 +121,25 @@ python3 backup_config.py -H 10.0.0.1 -u admin -p pass123 -d cisco --enable-passw
 python3 backup_config.py -H 172.16.0.1 -u admin -p pass123 -P telnet --port 2323 -d h3c
 ```
 
+### 清理旧备份
+
+```bash
+# 删除 60 天前的备份（默认）
+python3 backup_config.py --cleanup
+
+# 删除 30 天前的备份
+python3 backup_config.py --cleanup 30
+
+# 备份完成后自动清理旧文件
+python3 backup_config.py -c devices.csv --cleanup 90
+```
+
+`--cleanup` 有两种用法：
+- **独立使用**：仅清理输出目录中的旧备份文件，不执行新的备份
+- **搭配备份**：新备份保存后，自动删除超过指定天数的旧文件
+
+清理后如果设备目录或地点目录为空，也会一并删除。
+
 ### 命令行参数
 
 | 参数 | 默认值 | 说明 |
@@ -146,6 +165,7 @@ python3 backup_config.py -H 172.16.0.1 -u admin -p pass123 -P telnet --port 2323
 | `--no-filter` | 关闭 | 差异模式下禁用时间戳过滤 |
 | `--view` | 关闭 | 生成带语法高亮的 HTML 配置查看器 |
 | `--split` | 关闭 | 将 `--diff`/`--view` 输出按地点拆分为独立文件 |
+| `--cleanup [天]` | `60` | 删除超过指定天数的旧备份；可独立使用或搭配备份 |
 
 ## CSV 格式
 
