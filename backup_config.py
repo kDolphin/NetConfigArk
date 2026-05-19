@@ -708,7 +708,8 @@ class _BufferingHandler(logging.Handler):
     """
     Temporary log handler that buffers all records during progress bar display.
     Replaces the console handler so no log output interrupts the \r bar.
-    Records are flushed to the original handler after the bar finishes.
+    After the bar finishes, only WARNING+ records are replayed to the console
+    handler — INFO records are intentionally discarded (they go to file only).
     """
     def __init__(self) -> None:
         super().__init__(level=logging.DEBUG)
@@ -718,8 +719,10 @@ class _BufferingHandler(logging.Handler):
         self._records.append(record)
 
     def flush_to(self, handler: logging.Handler) -> None:
+        """Replay only WARNING+ records to the console handler."""
         for record in self._records:
-            handler.handle(record)
+            if record.levelno >= logging.WARNING:
+                handler.handle(record)
         self._records.clear()
 
 
