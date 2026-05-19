@@ -700,6 +700,76 @@ def precheck_single_device(device_info: Dict[str, str], timeout: int,
                 pass
 
 
+# ============================================================================
+# Progress bar
+# ============================================================================
+
+class _ProgressBar:
+    """
+    Thread-safe single-line progress bar using ANSI \r.
+    Renders: label [=====>    ] done/total  pct%  elapsed  last_msg
+    Falls back to plain text if stdout is not a TTY (e.g., redirected to file).
+    """
+    BAR_WIDTH = 24
+
+    def __init__(self, label: str, total: int) -> None:
+        self.label = label
+        self.total = total
+        self._done = 0
+        self._lock = __import__("threading").Lock()
+        self._start = time.time()
+        self._tty = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+        # Print the empty bar immediately so the line exists
+        self._render("")
+
+    def update(self, msg: str = "") -> None:
+        """Increment counter by 1 and refresh the bar with an optional message."""
+        with self._lock:
+            self._done += 1
+            self._render(msg)
+
+    def _render(self, msg: str) -> None:
+        pct = self._done / self.total if self.total else 1.0
+        filled = int(self.BAR_WIDTH * pct)
+        if filled < self.BAR_WIDTH:
+            bar = "=" * filled + ">" + " " * (self.BAR_WIDTH - filled - 1)
+        else:
+            bar = "=" * self.BAR_WIDTH
+        elapsed = time.time() - self._start
+        elapsed_str = f"{elapsed:.0f}s"
+        # Truncate msg to avoid wrapping on narrow terminals
+        if msg and len(msg) > 40:
+            msg = msg[:37] + "..."
+        line = (
+            f"  {self.label}  [{bar}]  "
+            f"{self._done}/{self.total}  {pct * 100:3.0f}%  "
+            f"{elapsed_str}"
+            + (f"  {msg}" if msg else "")
+        )
+        if self._tty:
+            # Pad to 100 chars to overwrite previous longer lines
+            sys.stdout.write(f"\r{line:<100}")
+            sys.stdout.flush()
+        else:
+            # Non-TTY: print each update as a new line (log-friendly)
+            if self._done > 0:
+                print(line)
+
+    def finish(self) -> None:
+        """Print final completed bar on its own line."""
+        if self._tty:
+            elapsed = time.time() - self._start
+            pct = self._done / self.total if self.total else 1.0
+            bar = "=" * self.BAR_WIDTH
+            line = (
+                f"  {self.label}  [{bar}]  "
+                f"{self._done}/{self.total}  {pct * 100:3.0f}%  "
+                f"{elapsed:.1f}s"
+            )
+            sys.stdout.write(f"\r{line:<100}\n")
+            sys.stdout.flush()
+
+
 def run_precheck(devices: List[Dict[str, str]], workers: int, timeout: int,
                  logger: logging.Logger) -> List[PrecheckResult]:
     """Run pre-check on all devices concurrently. Returns list of results."""
@@ -708,23 +778,33 @@ def run_precheck(devices: List[Dict[str, str]], workers: int, timeout: int,
 
     logger.info("Starting pre-check for %d device(s) with %d thread(s)...", total, workers)
     print()
+    bar = _ProgressBar("Pre-check ", total)
+
+    failed_lines: List[str] = []
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_map = {
             executor.submit(precheck_single_device, dev, timeout, logger): dev
             for dev in devices
         }
-        for i, future in enumerate(as_completed(future_map), start=1):
+        for future in as_completed(future_map):
             result = future.result()
             results.append(result)
             if not result.success:
                 status = "FAILED"
+                failed_lines.append(
+                    f"  [FAILED] {result.ip} ({result.hostname}): {result.error}")
             elif result.type_corrected:
-                status = f"OK (type corrected: {result.type_warning})"
+                status = f"OK*"  # corrected, shown in report
             else:
                 status = "OK"
-            print(f"  Pre-check [{i}/{total}] {result.ip} ({result.hostname}): {status}",
-                  flush=True)
+            bar.update(f"{result.ip} ({result.hostname}): {status}")
+
+    bar.finish()
+
+    # Print failed devices below the bar so they are not overwritten
+    for line in failed_lines:
+        print(line)
 
     return results
 
@@ -1028,6 +1108,10 @@ def run_backup(devices: List[Dict[str, str]], output_dir: str,
     total = len(devices)
 
     logger.info("Starting backup for %d device(s) with %d thread(s)...", total, workers)
+    bar = _ProgressBar("Backup    ", total)
+
+    warn_lines: List[str] = []
+    fail_lines: List[str] = []
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_map = {
@@ -1035,14 +1119,26 @@ def run_backup(devices: List[Dict[str, str]], output_dir: str,
                             timeout, read_timeout, run_timestamp, logger): dev
             for dev in devices
         }
-        for i, future in enumerate(as_completed(future_map), start=1):
+        for future in as_completed(future_map):
             result = future.result()
             results.append(result)
-            if result.success:
-                status = "OK" if not result.warning else "WARNING"
+            if result.success and not result.warning:
+                status = "OK"
+            elif result.success and result.warning:
+                status = "WARNING"
+                warn_lines.append(
+                    f"  [WARNING] {result.ip} ({result.hostname}): {result.warning}")
             else:
                 status = "FAILED"
-            print(f"  Backup [{i}/{total}] {result.ip} ({result.hostname}): {status}")
+                fail_lines.append(
+                    f"  [FAILED]  {result.ip} ({result.hostname}): {result.error}")
+            bar.update(f"{result.ip} ({result.hostname}): {status}")
+
+    bar.finish()
+
+    # Print warnings and failures below the bar
+    for line in warn_lines + fail_lines:
+        print(line)
 
     return results
 
