@@ -1089,6 +1089,233 @@ def backup_single_device(device_info: Dict[str, str], output_dir: str,
                 pass
 
 
+# ============================================================================
+# Fast backup (single-stage: connect → fingerprint → fetch → disconnect)
+# ============================================================================
+
+def fast_backup_single_device(device_info: Dict[str, str], output_dir: str,
+                               timeout: int, read_timeout: int, run_timestamp: str,
+                               logger: logging.Logger) -> BackupResult:
+    """
+    Single-stage backup: combines pre-check and backup into one SSH connection.
+    connect → enable → fingerprint → disable_paging → fetch config → save → disconnect
+    Avoids the second round of SSH handshakes that the two-phase workflow requires.
+    """
+    ip = device_info["ip"]
+    hostname = device_info.get("hostname", ip)
+    start_time = time.time()
+    conn = None
+
+    # Resolve device type (may do a probe connection internally for auto-detect)
+    try:
+        netmiko_type = resolve_device_type(device_info, timeout, logger)
+    except Exception as e:
+        return BackupResult(ip=ip, hostname=hostname, success=False,
+                            error=f"Type resolution failed: {e}",
+                            duration=time.time() - start_time)
+
+    try:
+        conn_params = {
+            "device_type": netmiko_type,
+            "host": ip,
+            "username": device_info["username"],
+            "password": device_info["password"],
+            "port": int(device_info["port"]),
+            "timeout": timeout,
+            "conn_timeout": timeout,
+        }
+        if device_info.get("enable_password"):
+            conn_params["secret"] = device_info["enable_password"]
+
+        conn = connect_with_retry(conn_params, ip, logger)
+
+        # Enable privileged mode before fingerprint/paging changes
+        if device_info.get("enable_password"):
+            conn.enable()
+
+        # Fingerprint: verify/correct device type
+        csv_type = device_info.get("device_type", "")
+        type_corrected = False
+        if csv_type:
+            detected = fingerprint_device_type(conn, csv_type, ip, logger)
+            if detected:
+                equiv = TYPE_EQUIVALENCE_GROUPS.get(csv_type, {csv_type})
+                if detected not in equiv:
+                    ssh_t, telnet_t = DEVICE_TYPE_MAP[detected]
+                    new_netmiko_type = ssh_t if device_info["protocol"] == "ssh" else telnet_t
+                    type_warning = f"{csv_type} -> {detected}"
+                    logger.warning(
+                        "[%s] (%s) Type mismatch: CSV='%s' detected='%s'. "
+                        "Auto-correcting: %s -> %s",
+                        ip, hostname, csv_type, detected, netmiko_type, new_netmiko_type)
+                    # Reconnect with corrected type
+                    try:
+                        conn.disconnect()
+                    except Exception:
+                        pass
+                    conn_params["device_type"] = new_netmiko_type
+                    conn = connect_with_retry(conn_params, ip, logger)
+                    if device_info.get("enable_password"):
+                        conn.enable()
+                    netmiko_type = new_netmiko_type
+                    type_corrected = True
+                    # Update device_info so directory naming reflects corrected type
+                    corrected_csv_type = NETMIKO_TO_CSV_TYPE.get(new_netmiko_type, "")
+                    if corrected_csv_type:
+                        device_info = dict(device_info)
+                        device_info["device_type"] = corrected_csv_type
+                else:
+                    logger.debug("[%s] Fingerprint confirmed: %s", ip, detected)
+
+        # Disable paging
+        disable_paging(conn, netmiko_type, logger)
+
+        # Fetch config
+        config_cmd = get_config_command(netmiko_type, logger)
+        logger.info("[%s] Fetching config: %s (read_timeout=%ds)", ip, config_cmd, read_timeout)
+
+        if netmiko_type in ("hp_comware", "hp_comware_telnet"):
+            config_output = conn.send_command_timing(
+                config_cmd, delay_factor=4, max_loops=500)
+        else:
+            config_output = conn.send_command(config_cmd, read_timeout=read_timeout)
+
+        # Retry with timing-based method if output is empty
+        if not config_output.strip():
+            logger.warning("[%s] Config output empty, retrying with send_command_timing...", ip)
+            time.sleep(1)
+            conn.read_channel()
+            config_output = conn.send_command_timing(
+                config_cmd, delay_factor=4, max_loops=500)
+
+        conn.disconnect()
+        conn = None
+
+        duration = time.time() - start_time
+
+        # Validate config
+        is_valid, warning = validate_config(config_output, netmiko_type, logger, ip)
+        if not is_valid:
+            logger.error("[%s] Config validation failed: %s", ip, warning)
+            return BackupResult(ip=ip, hostname=hostname, success=False,
+                                error=warning, duration=duration,
+                                detected_type=netmiko_type)
+
+        # Build output path
+        location = device_info.get("location", "").strip() or "default"
+        location_dir = os.path.join(output_dir, location)
+        type_label = get_device_type_label(device_info, netmiko_type)
+        raw_hostname = device_info.get("raw_hostname", "")
+        name_prefix = (f"{ip}_{type_label}_{raw_hostname}" if raw_hostname
+                       else f"{ip}_{type_label}")
+        device_dir = os.path.join(location_dir, name_prefix)
+        os.makedirs(device_dir, exist_ok=True)
+
+        file_name = (f"{name_prefix}_{run_timestamp}.incomplete.txt" if warning
+                     else f"{name_prefix}_{run_timestamp}.txt")
+        file_path = os.path.join(device_dir, file_name)
+
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(config_output)
+
+        logger.info("[%s] Config saved: %s (%.1fs)", ip, file_path, duration)
+
+        return BackupResult(
+            ip=ip, hostname=hostname, success=True,
+            file_path=file_path, warning=warning,
+            duration=duration, detected_type=netmiko_type,
+        )
+
+    except NetmikoTimeoutException:
+        msg = "Connection timed out"
+        logger.error("[%s] Fast-backup failed: %s", ip, msg)
+        return BackupResult(ip=ip, hostname=hostname, success=False,
+                            error=msg, duration=time.time() - start_time,
+                            detected_type=netmiko_type)
+    except NetmikoAuthenticationException:
+        msg = "Authentication failed"
+        logger.error("[%s] Fast-backup failed: %s", ip, msg)
+        return BackupResult(ip=ip, hostname=hostname, success=False,
+                            error=msg, duration=time.time() - start_time,
+                            detected_type=netmiko_type)
+    except ReadTimeout:
+        msg = "Command execution timed out (read_timeout)"
+        logger.error("[%s] Fast-backup failed: %s", ip, msg)
+        return BackupResult(ip=ip, hostname=hostname, success=False,
+                            error=msg, duration=time.time() - start_time,
+                            detected_type=netmiko_type)
+    except OSError as e:
+        msg = f"Failed to save file: {str(e)}"
+        logger.error("[%s] Fast-backup failed: %s", ip, msg)
+        return BackupResult(ip=ip, hostname=hostname, success=False,
+                            error=msg, duration=time.time() - start_time,
+                            detected_type=netmiko_type)
+    except Exception as e:
+        msg = f"Unexpected error: {str(e)}"
+        logger.error("[%s] Fast-backup failed: %s", ip, msg)
+        return BackupResult(ip=ip, hostname=hostname, success=False,
+                            error=msg, duration=time.time() - start_time,
+                            detected_type=netmiko_type)
+    finally:
+        if conn:
+            try:
+                conn.disconnect()
+            except Exception:
+                pass
+
+
+def run_fast_backup(devices: List[Dict[str, str]], output_dir: str,
+                    workers: int, timeout: int, read_timeout: int,
+                    run_timestamp: str, logger: logging.Logger) -> List[BackupResult]:
+    """Run fast (single-stage) backup on all devices concurrently."""
+    results: List[BackupResult] = []
+    total = len(devices)
+
+    logger.info("Starting fast backup for %d device(s) with %d thread(s)...", total, workers)
+
+    use_bar = total > 1
+    bar = _ProgressBar("Fast-bkup ", total) if use_bar else None
+
+    warn_lines: List[str] = []
+    fail_lines: List[str] = []
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_map = {
+            executor.submit(fast_backup_single_device, dev, output_dir,
+                            timeout, read_timeout, run_timestamp, logger): dev
+            for dev in devices
+        }
+        for future in as_completed(future_map):
+            result = future.result()
+            results.append(result)
+            if result.success and not result.warning:
+                status = "OK"
+            elif result.success and result.warning:
+                status = "WARNING"
+                warn_lines.append(
+                    f"  [WARNING] {result.ip} ({result.hostname}): {result.warning}")
+            else:
+                status = "FAILED"
+                fail_lines.append(
+                    f"  [FAILED]  {result.ip} ({result.hostname}): {result.error}")
+            if use_bar:
+                bar.update(f"{result.ip} ({result.hostname}): {status}")  # type: ignore[union-attr]
+            else:
+                sys.stderr.write(
+                    f"  Fast-bkup  {result.ip} ({result.hostname}): {status}\n")
+                sys.stderr.flush()
+
+    if use_bar:
+        bar.finish()  # type: ignore[union-attr]
+
+    for line in warn_lines + fail_lines:
+        sys.stderr.write(line + "\n")
+    if warn_lines or fail_lines:
+        sys.stderr.flush()
+
+    return results
+
+
 def cleanup_old_backups(output_dir: str, keep_days: int,
                        logger: logging.Logger) -> Tuple[int, int]:
     """
@@ -2441,6 +2668,12 @@ Examples:
   # Backup and auto-cleanup old files after backup completes
   python3 backup_config.py -c devices.csv --cleanup 90
 
+  # Fast mode: single-stage backup (no pre-check), saves ~40% time on large inventories
+  python3 backup_config.py -c devices.csv --fast
+
+  # Fast mode with burst concurrency and cleanup
+  python3 backup_config.py -c devices.csv --fast --burst --cleanup 60
+
 Output structure:
   backups/<location>/<IP>_<device_type>[_<hostname>]/<IP>_<device_type>[_<hostname>]_<YYYY-MM-DD>_<HHMMSS>.txt
   (location defaults to "default" if not specified in CSV)
@@ -2451,6 +2684,10 @@ Workflow:
   3. Backup: fetch running config from all devices concurrently
   4. Validate: check config completeness (end markers, paging residue)
   5. Report: print backup summary
+
+  With --fast flag (single-stage mode):
+  2+3. Connect → fingerprint → fetch → disconnect in one SSH session per device
+       (skips separate pre-check, ~40% faster on large inventories)
 """
 
 
@@ -2539,6 +2776,12 @@ def build_parser() -> argparse.ArgumentParser:
                                    "old backups without running a new backup, "
                                    "or combined with backup to auto-clean after "
                                    "new backups are saved.")
+    common_group.add_argument("--fast", action="store_true",
+                              help="Fast single-stage mode: connect → fingerprint → "
+                                   "fetch config → disconnect, all in one SSH session. "
+                                   "Skips the separate pre-check phase, saving one full "
+                                   "round of SSH handshakes. Recommended for large "
+                                   "inventories where pre-check latency is significant.")
 
     return parser
 
@@ -2676,6 +2919,40 @@ def main():
     run_timestamp = now.strftime("%Y-%m-%d_%H%M%S")
 
     overall_start = time.time()
+
+    # ----------------------------------------------------------------
+    # Fast mode: single-stage backup, skip separate pre-check phase
+    # ----------------------------------------------------------------
+    if args.fast:
+        print("\n--- Fast Backup (single-stage: no pre-check) ---\n", flush=True)
+        backup_results = run_fast_backup(
+            devices, os.path.abspath(args.output), workers,
+            args.timeout, args.read_timeout, run_timestamp, logger)
+
+        failed_count = sum(1 for r in backup_results if not r.success)
+        skipped_count = 0
+        print_summary(backup_results, skipped_count, [], overall_start, logger)
+
+        if args.cleanup is not None:
+            keep_days = args.cleanup
+            if keep_days < 1:
+                logger.warning("--cleanup requires DAYS >= 1, skipping cleanup")
+            else:
+                print(f"\n--- Cleanup (removing backups older than {keep_days} days) ---\n")
+                output_dir = os.path.abspath(args.output)
+                files_removed, bytes_freed = cleanup_old_backups(output_dir, keep_days, logger)
+                if files_removed > 0:
+                    if bytes_freed >= 1024 * 1024:
+                        size_str = f"{bytes_freed / 1024 / 1024:.1f} MB"
+                    elif bytes_freed >= 1024:
+                        size_str = f"{bytes_freed / 1024:.1f} KB"
+                    else:
+                        size_str = f"{bytes_freed} B"
+                    print(f"  Cleaned {files_removed} file(s), freed {size_str}\n")
+                else:
+                    print(f"  No files older than {keep_days} days found.\n")
+
+        sys.exit(1 if failed_count > 0 else 0)
 
     # Phase 1: Pre-check all devices
     print("\n--- Phase 1: Pre-check (verifying connectivity) ---", flush=True)

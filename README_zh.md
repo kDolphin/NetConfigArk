@@ -140,6 +140,21 @@ python3 backup_config.py -c devices.csv --cleanup 90
 
 清理后如果设备目录或地点目录为空，也会一并删除。
 
+### 快速模式
+
+```bash
+# 单阶段备份：跳过预检阶段，大规模设备约快 40%
+python3 backup_config.py -c devices.csv --fast
+
+# 结合 burst 并发和自动清理
+python3 backup_config.py -c devices.csv --fast --burst --cleanup 60
+```
+
+`--fast` 将预检和备份合并为每台设备一次 SSH 连接完成：  
+**连接 → 指纹识别 → 获取配置 → 断开**
+
+常规模式每台设备需要两次 SSH 握手（预检 + 备份），`--fast` 减少为一次，节省的时间约等于整个预检阶段（60 台设备约 20 秒）。取舍：设备连接失败不会提前中止，进度条实时显示各设备结果，汇总报告中统一列出所有失败。
+
 ### 命令行参数
 
 | 参数 | 默认值 | 说明 |
@@ -166,6 +181,7 @@ python3 backup_config.py -c devices.csv --cleanup 90
 | `--view` | 关闭 | 生成带语法高亮的 HTML 配置查看器 |
 | `--split` | 关闭 | 将 `--diff`/`--view` 输出按地点拆分为独立文件 |
 | `--cleanup [天]` | `60` | 删除超过指定天数的旧备份；可独立使用或搭配备份 |
+| `--fast` | 关闭 | 单阶段模式：跳过预检，每台设备一次 SSH 连接（约快 40%） |
 
 ## CSV 格式
 

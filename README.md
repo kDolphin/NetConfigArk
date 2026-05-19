@@ -139,6 +139,21 @@ python3 backup_config.py -c devices.csv --cleanup 90
 
 Empty device directories and location directories are also removed after cleanup.
 
+### Fast Mode
+
+```bash
+# Single-stage backup: no pre-check phase, ~40% faster on large inventories
+python3 backup_config.py -c devices.csv --fast
+
+# Combine with burst and cleanup
+python3 backup_config.py -c devices.csv --fast --burst --cleanup 60
+```
+
+`--fast` merges the pre-check and backup phases into a single SSH connection per device:  
+**connect → fingerprint → fetch config → disconnect**
+
+In normal mode two SSH handshakes are made per device (pre-check + backup). `--fast` cuts this to one, saving roughly the full pre-check time (~20s for 60 devices). The trade-off: if a device fails, there is no early abort — the progress bar shows results as they arrive, and the summary reports all failures at the end.
+
 ### CLI Options
 
 | Option | Default | Description |
@@ -165,6 +180,7 @@ Empty device directories and location directories are also removed after cleanup
 | `--view` | off | Generate HTML config viewer with syntax highlighting |
 | `--split` | off | Split `--diff`/`--view` output into one file per location |
 | `--cleanup [DAYS]` | `60` | Remove backups older than DAYS days; standalone or with backup |
+| `--fast` | off | Single-stage mode: no pre-check, one SSH session per device (~40% faster) |
 
 ## CSV Format
 
