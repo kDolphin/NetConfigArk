@@ -704,16 +704,35 @@ def precheck_single_device(device_info: Dict[str, str], timeout: int,
 # Progress bar
 # ============================================================================
 
+class _BufferingHandler(logging.Handler):
+    """
+    Temporary log handler that buffers all records during progress bar display.
+    Replaces the console handler so no log output interrupts the \r bar.
+    Records are flushed to the original handler after the bar finishes.
+    """
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self._records: List[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self._records.append(record)
+
+    def flush_to(self, handler: logging.Handler) -> None:
+        for record in self._records:
+            handler.handle(record)
+        self._records.clear()
+
+
 class _ProgressBar:
     """
-    Thread-safe single-line progress bar using ANSI \r written to stderr.
+    Thread-safe single-line progress bar using ANSI \\r written to stderr.
     Renders: label [=====>    ] done/total  pct%  elapsed  last_msg
-    Falls back to plain text if stderr is not a TTY (e.g., redirected to file).
 
-    Writing to stderr keeps progress output separate from stdout data pipes,
-    and avoids interleaving with the logging console handler (also on stderr).
-    During active rendering the logging console handler is silenced to WARNING
-    so that INFO messages don't break the single-line overwrite effect.
+    During display, the logging console handler is replaced by a buffering
+    handler so that no log output (INFO/WARNING/ERROR) interrupts the bar.
+    All buffered records are flushed to the original handler after finish().
+
+    Falls back to plain per-line output when stderr is not a TTY.
     """
     BAR_WIDTH = 24
 
@@ -724,18 +743,20 @@ class _ProgressBar:
         self._lock = __import__("threading").Lock()
         self._start = time.time()
         self._tty = hasattr(sys.stderr, "isatty") and sys.stderr.isatty()
-        # Silence console log handler during progress to avoid line breaks
-        self._prev_level: Optional[int] = None
+
+        # Swap console handler with buffering handler
         self._console_handler: Optional[logging.Handler] = None
+        self._buf_handler = _BufferingHandler()
         root_logger = logging.getLogger("backup_config")
         for h in root_logger.handlers:
             if isinstance(h, logging.StreamHandler) and not isinstance(
                     h, logging.FileHandler):
                 self._console_handler = h
-                self._prev_level = h.level
-                h.setLevel(logging.WARNING)
+                root_logger.removeHandler(h)
+                root_logger.addHandler(self._buf_handler)
                 break
-        # Print the empty bar immediately so the line exists
+
+        # Print the empty bar immediately
         self._render("")
 
     def update(self, msg: str = "") -> None:
@@ -753,7 +774,6 @@ class _ProgressBar:
             bar = "=" * self.BAR_WIDTH
         elapsed = time.time() - self._start
         elapsed_str = f"{elapsed:.0f}s"
-        # Truncate msg to avoid wrapping on narrow terminals
         if msg and len(msg) > 40:
             msg = msg[:37] + "..."
         line = (
@@ -763,23 +783,20 @@ class _ProgressBar:
             + (f"  {msg}" if msg else "")
         )
         if self._tty:
-            # Pad to 100 chars to overwrite previous longer lines
             sys.stderr.write(f"\r{line:<100}")
             sys.stderr.flush()
         else:
-            # Non-TTY: print each update as a new line (log-friendly)
             if self._done > 0:
                 sys.stderr.write(line + "\n")
                 sys.stderr.flush()
 
     def finish(self) -> None:
-        """Print final completed bar on its own line, restore log level."""
+        """Complete the bar, restore console handler, flush buffered log records."""
         elapsed = time.time() - self._start
-        pct = self._done / self.total if self.total else 1.0
         bar = "=" * self.BAR_WIDTH
         line = (
             f"  {self.label}  [{bar}]  "
-            f"{self._done}/{self.total}  {pct * 100:3.0f}%  "
+            f"{self._done}/{self.total}  100%  "
             f"{elapsed:.1f}s"
         )
         if self._tty:
@@ -787,9 +804,13 @@ class _ProgressBar:
         else:
             sys.stderr.write(line + "\n")
         sys.stderr.flush()
-        # Restore console handler log level
-        if self._console_handler is not None and self._prev_level is not None:
-            self._console_handler.setLevel(self._prev_level)
+
+        # Restore the original console handler and flush buffered records
+        root_logger = logging.getLogger("backup_config")
+        root_logger.removeHandler(self._buf_handler)
+        if self._console_handler is not None:
+            root_logger.addHandler(self._console_handler)
+            self._buf_handler.flush_to(self._console_handler)
 
 
 def run_precheck(devices: List[Dict[str, str]], workers: int, timeout: int,
@@ -800,7 +821,10 @@ def run_precheck(devices: List[Dict[str, str]], workers: int, timeout: int,
 
     logger.info("Starting pre-check for %d device(s) with %d thread(s)...", total, workers)
     print()
-    bar = _ProgressBar("Pre-check ", total)
+
+    # Single device: skip progress bar, just show one status line
+    use_bar = total > 1
+    bar = _ProgressBar("Pre-check ", total) if use_bar else None
 
     failed_lines: List[str] = []
 
@@ -817,16 +841,24 @@ def run_precheck(devices: List[Dict[str, str]], workers: int, timeout: int,
                 failed_lines.append(
                     f"  [FAILED] {result.ip} ({result.hostname}): {result.error}")
             elif result.type_corrected:
-                status = f"OK*"  # corrected, shown in report
+                status = "OK*"
             else:
                 status = "OK"
-            bar.update(f"{result.ip} ({result.hostname}): {status}")
+            if use_bar:
+                bar.update(f"{result.ip} ({result.hostname}): {status}")  # type: ignore[union-attr]
+            else:
+                sys.stderr.write(
+                    f"  Pre-check  {result.ip} ({result.hostname}): {status}\n")
+                sys.stderr.flush()
 
-    bar.finish()
+    if use_bar:
+        bar.finish()  # type: ignore[union-attr]
 
-    # Print failed devices below the bar so they are not overwritten
+    # Print failed devices below the bar
     for line in failed_lines:
-        print(line)
+        sys.stderr.write(line + "\n")
+    if failed_lines:
+        sys.stderr.flush()
 
     return results
 
@@ -1130,7 +1162,9 @@ def run_backup(devices: List[Dict[str, str]], output_dir: str,
     total = len(devices)
 
     logger.info("Starting backup for %d device(s) with %d thread(s)...", total, workers)
-    bar = _ProgressBar("Backup    ", total)
+
+    use_bar = total > 1
+    bar = _ProgressBar("Backup    ", total) if use_bar else None
 
     warn_lines: List[str] = []
     fail_lines: List[str] = []
@@ -1154,13 +1188,21 @@ def run_backup(devices: List[Dict[str, str]], output_dir: str,
                 status = "FAILED"
                 fail_lines.append(
                     f"  [FAILED]  {result.ip} ({result.hostname}): {result.error}")
-            bar.update(f"{result.ip} ({result.hostname}): {status}")
+            if use_bar:
+                bar.update(f"{result.ip} ({result.hostname}): {status}")  # type: ignore[union-attr]
+            else:
+                sys.stderr.write(
+                    f"  Backup     {result.ip} ({result.hostname}): {status}\n")
+                sys.stderr.flush()
 
-    bar.finish()
+    if use_bar:
+        bar.finish()  # type: ignore[union-attr]
 
     # Print warnings and failures below the bar
     for line in warn_lines + fail_lines:
-        print(line)
+        sys.stderr.write(line + "\n")
+    if warn_lines or fail_lines:
+        sys.stderr.flush()
 
     return results
 
