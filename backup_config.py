@@ -706,9 +706,14 @@ def precheck_single_device(device_info: Dict[str, str], timeout: int,
 
 class _ProgressBar:
     """
-    Thread-safe single-line progress bar using ANSI \r.
+    Thread-safe single-line progress bar using ANSI \r written to stderr.
     Renders: label [=====>    ] done/total  pct%  elapsed  last_msg
-    Falls back to plain text if stdout is not a TTY (e.g., redirected to file).
+    Falls back to plain text if stderr is not a TTY (e.g., redirected to file).
+
+    Writing to stderr keeps progress output separate from stdout data pipes,
+    and avoids interleaving with the logging console handler (also on stderr).
+    During active rendering the logging console handler is silenced to WARNING
+    so that INFO messages don't break the single-line overwrite effect.
     """
     BAR_WIDTH = 24
 
@@ -718,7 +723,18 @@ class _ProgressBar:
         self._done = 0
         self._lock = __import__("threading").Lock()
         self._start = time.time()
-        self._tty = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+        self._tty = hasattr(sys.stderr, "isatty") and sys.stderr.isatty()
+        # Silence console log handler during progress to avoid line breaks
+        self._prev_level: Optional[int] = None
+        self._console_handler: Optional[logging.Handler] = None
+        root_logger = logging.getLogger("backup_config")
+        for h in root_logger.handlers:
+            if isinstance(h, logging.StreamHandler) and not isinstance(
+                    h, logging.FileHandler):
+                self._console_handler = h
+                self._prev_level = h.level
+                h.setLevel(logging.WARNING)
+                break
         # Print the empty bar immediately so the line exists
         self._render("")
 
@@ -748,26 +764,32 @@ class _ProgressBar:
         )
         if self._tty:
             # Pad to 100 chars to overwrite previous longer lines
-            sys.stdout.write(f"\r{line:<100}")
-            sys.stdout.flush()
+            sys.stderr.write(f"\r{line:<100}")
+            sys.stderr.flush()
         else:
             # Non-TTY: print each update as a new line (log-friendly)
             if self._done > 0:
-                print(line)
+                sys.stderr.write(line + "\n")
+                sys.stderr.flush()
 
     def finish(self) -> None:
-        """Print final completed bar on its own line."""
+        """Print final completed bar on its own line, restore log level."""
+        elapsed = time.time() - self._start
+        pct = self._done / self.total if self.total else 1.0
+        bar = "=" * self.BAR_WIDTH
+        line = (
+            f"  {self.label}  [{bar}]  "
+            f"{self._done}/{self.total}  {pct * 100:3.0f}%  "
+            f"{elapsed:.1f}s"
+        )
         if self._tty:
-            elapsed = time.time() - self._start
-            pct = self._done / self.total if self.total else 1.0
-            bar = "=" * self.BAR_WIDTH
-            line = (
-                f"  {self.label}  [{bar}]  "
-                f"{self._done}/{self.total}  {pct * 100:3.0f}%  "
-                f"{elapsed:.1f}s"
-            )
-            sys.stdout.write(f"\r{line:<100}\n")
-            sys.stdout.flush()
+            sys.stderr.write(f"\r{line:<100}\n")
+        else:
+            sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+        # Restore console handler log level
+        if self._console_handler is not None and self._prev_level is not None:
+            self._console_handler.setLevel(self._prev_level)
 
 
 def run_precheck(devices: List[Dict[str, str]], workers: int, timeout: int,
@@ -2288,8 +2310,8 @@ def setup_logging(verbose: bool, log_dir: str = "logs") -> logging.Logger:
     ))
     logger.addHandler(fh)
 
-    # Console handler - outputs to stdout to avoid interleaving with print()
-    ch = logging.StreamHandler(stream=sys.stdout)
+    # Console handler - outputs to stderr, separate from stdout data
+    ch = logging.StreamHandler(stream=sys.stderr)
     ch.setLevel(logging.DEBUG if verbose else logging.INFO)
     ch.setFormatter(logging.Formatter(
         "[%(levelname)-7s] %(message)s",
