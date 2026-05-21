@@ -59,6 +59,7 @@ DEVICE_TYPE_MAP: Dict[str, Tuple[str, str]] = {
     "juniper":    ("juniper_junos",     "juniper_junos_telnet"),
     "paloalto":   ("paloalto_panos",    "paloalto_panos"),
     "routeros":   ("mikrotik_routeros", "mikrotik_routeros"),
+    "ruijie":     ("ruijie_os",         "ruijie_os_telnet"),
 }
 
 # Reverse map: netmiko type -> short CSV device_type name
@@ -90,6 +91,8 @@ NETMIKO_TYPE_TO_COMMAND: Dict[str, str] = {
     "juniper_junos_telnet": "show configuration",
     "paloalto_panos":     "show config running",
     "mikrotik_routeros":  "export",
+    "ruijie_os":          "show running-config",
+    "ruijie_os_telnet":   "show running-config",
 }
 
 # netmiko device_type -> disable paging command (session-scoped, auto-reverts on disconnect)
@@ -113,6 +116,8 @@ DISABLE_PAGING_COMMANDS: Dict[str, Optional[str]] = {
     "juniper_junos_telnet": "set cli screen-length 0",
     "paloalto_panos":     "set cli pager off",
     "mikrotik_routeros":  None,  # RouterOS export outputs without paging
+    "ruijie_os":          "terminal length 0",
+    "ruijie_os_telnet":   "terminal length 0",
 }
 
 # Fortinet requires multi-step command to disable paging
@@ -143,6 +148,8 @@ CONFIG_END_MARKERS: Dict[str, Optional[str]] = {
     "juniper_junos_telnet": "}",
     "paloalto_panos":     None,  # no fixed end marker
     "mikrotik_routeros":  None,  # no fixed end marker
+    "ruijie_os":          "end",
+    "ruijie_os_telnet":   "end",
 }
 
 # Device type info for --list-types display
@@ -158,6 +165,7 @@ DEVICE_TYPE_INFO = [
     ("juniper",    "Juniper JunOS Router/Switch/SRX",    "show configuration"),
     ("paloalto",   "Palo Alto PAN-OS Firewall",          "show config running"),
     ("routeros",   "MikroTik RouterOS Router/Switch",    "export"),
+    ("ruijie",     "Ruijie RG-OS Switch/Router",         "show running-config"),
 ]
 
 SUPPORTED_TYPES = [t[0] for t in DEVICE_TYPE_INFO]
@@ -196,6 +204,7 @@ VERSION_COMMANDS: Dict[str, str] = {
     "juniper":    "show version",
     "paloalto":   "show system info",
     "routeros":   "/system resource print",
+    "ruijie":     "show version",
 }
 
 # Fingerprint patterns: (csv_type, compiled_regex)
@@ -215,6 +224,7 @@ DEVICE_FINGERPRINTS: List[Tuple[str, "re.Pattern[str]"]] = [
     ("juniper",    re.compile(r"\bJUNOS\b", re.IGNORECASE)),
     ("paloalto",   re.compile(r"Palo\s+Alto|PAN-?OS", re.IGNORECASE)),
     ("routeros",   re.compile(r"MikroTik|RouterOS", re.IGNORECASE)),
+    ("ruijie",     re.compile(r"\bRuijie\b|Ruijie\s+Networks|RG-?OS", re.IGNORECASE)),
 ]
 
 # Equivalent device type groups — types within the same group use the same
@@ -231,6 +241,7 @@ TYPE_EQUIVALENCE_GROUPS: Dict[str, set] = {
     "juniper":    {"juniper"},
     "paloalto":   {"paloalto"},
     "routeros":   {"routeros"},
+    "ruijie":     {"ruijie"},
 }
 
 
