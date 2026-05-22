@@ -19,6 +19,7 @@
 | `juniper` | Juniper JunOS 路由器/交换机/SRX | `show configuration` |
 | `paloalto` | Palo Alto PAN-OS 防火墙 | `show config running` |
 | `routeros` | MikroTik RouterOS 路由器/交换机 | `export` |
+| `ruijie` | 锐捷 RG-OS 交换机/路由器 | `show running-config` |
 
 ## 功能特性
 

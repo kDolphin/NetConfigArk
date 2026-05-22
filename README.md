@@ -19,6 +19,7 @@ Network device configuration backup tool. Connects to switches, routers, and fir
 | `juniper` | Juniper JunOS Router/Switch/SRX | `show configuration` |
 | `paloalto` | Palo Alto PAN-OS Firewall | `show config running` |
 | `routeros` | MikroTik RouterOS Router/Switch | `export` |
+| `ruijie` | Ruijie RG-OS Switch/Router | `show running-config` |
 
 ## Features
 
